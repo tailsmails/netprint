@@ -312,7 +312,7 @@ fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, b
 
 fn check_dns_poisoning() bool {
 	rand_val := time.ticks()
-	fake_host := 'env-detect-${rand_val}.nonexistent'
+	fake_host := 'o${rand_val}.com'
 	res := os.execute('ping -c 1 -W 1 ${fake_host}')
 	if res.exit_code == 0 || res.output.contains('PING') {
 		return true
