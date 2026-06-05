@@ -30,10 +30,14 @@ struct NetworkProfile {
 	ip_ttl    int
 	ip_tos    int
 	ip_df     bool
+	ip_id     u16
 	tcp_win   int
 	tcp_opts  string
 	tcp_tsval u32
 	tls_ja4s  string
+	tls_cert  string
+	dns_bad   bool
+	pmtu      int
 }
 
 fn write_u16(mut arr []u8, val int) {
@@ -56,20 +60,12 @@ fn build_dynamic_client_hello(sni string) []u8 {
 	exts << u8(0x00)
 	write_u16(mut exts, sni_bytes.len)
 	write_bytes(mut exts, sni_bytes)
-	
-	write_u16(mut exts, 0x002b)
-	write_u16(mut exts, 5)
-	exts << u8(4)
-	write_u16(mut exts, 0x0304)
-	write_u16(mut exts, 0x0303)
-	
 	write_u16(mut exts, 0x000a)
 	write_u16(mut exts, 8)
 	write_u16(mut exts, 6)
 	write_u16(mut exts, 0x001d)
 	write_u16(mut exts, 0x0017)
 	write_u16(mut exts, 0x0018)
-	
 	write_u16(mut exts, 0x000d)
 	write_u16(mut exts, 10)
 	write_u16(mut exts, 8)
@@ -77,16 +73,6 @@ fn build_dynamic_client_hello(sni string) []u8 {
 	write_u16(mut exts, 0x0503)
 	write_u16(mut exts, 0x0603)
 	write_u16(mut exts, 0x0804)
-
-	write_u16(mut exts, 0x0033)
-	write_u16(mut exts, 38)
-	write_u16(mut exts, 36)
-	write_u16(mut exts, 0x001d)
-	write_u16(mut exts, 32)
-	for _ in 0 .. 32 {
-		exts << u8(0x5A)
-	}
-
 	write_u16(mut exts, 0x0010)
 	write_u16(mut exts, 14)
 	write_u16(mut exts, 12)
@@ -109,7 +95,7 @@ fn build_dynamic_client_hello(sni string) []u8 {
 		hs << u8(i + 1)
 	}
 	hs << u8(0x00)
-	ciphers := [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8]
+	ciphers := [0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8]
 	write_u16(mut hs, ciphers.len * 2)
 	for c in ciphers {
 		write_u16(mut hs, c)
@@ -133,41 +119,96 @@ fn build_dynamic_client_hello(sni string) []u8 {
 	return record
 }
 
-fn get_deep_tls_fingerprint(host string, port int) string {
-	mut conn := net.dial_tcp('${host}:${port}') or { return 'ERR_CONN' }
+fn parse_tls_records(buf []u8, n int) (string, string) {
+	mut ja4s := 'ERR_HANDSHAKE'
+	mut cert_fp := 'NO_CERT'
+	mut idx := 0
+	for idx + 5 <= n {
+		content_type := buf[idx]
+		if content_type != 0x16 {
+			break
+		}
+		record_len := int((u32(buf[idx + 3]) << 8) | u32(buf[idx + 4]))
+		if idx + 5 + record_len > n {
+			break
+		}
+		mut hs_idx := idx + 5
+		limit := idx + 5 + record_len
+		for hs_idx + 4 <= limit {
+			hs_type := buf[hs_idx]
+			hs_len := int((u32(buf[hs_idx + 1]) << 16) | (u32(buf[hs_idx + 2]) << 8) | u32(buf[hs_idx + 3]))
+			if hs_idx + 4 + hs_len > limit {
+				break
+			}
+			if hs_type == 0x02 {
+				version := '${buf[hs_idx + 4]:02X}${buf[hs_idx + 5]:02X}'
+				sid_len := int(buf[hs_idx + 38])
+				cipher_idx := hs_idx + 39 + sid_len
+				if cipher_idx + 1 < limit {
+					cipher := '${buf[cipher_idx]:02X}${buf[cipher_idx + 1]:02X}'
+					mut ext_list := []string{}
+					ext_len_idx := cipher_idx + 3
+					if ext_len_idx + 1 < limit {
+						ext_total_len := int((u32(buf[ext_len_idx]) << 8) | u32(buf[ext_len_idx + 1]))
+						mut current_idx := ext_len_idx + 2
+						for current_idx + 3 < limit && current_idx < ext_len_idx + 2 + ext_total_len {
+							ext_type := '${buf[current_idx]:02X}${buf[current_idx + 1]:02X}'
+							ext_len := int((u32(buf[current_idx + 2]) << 8) | u32(buf[current_idx + 3]))
+							ext_list << ext_type
+							current_idx += 4 + ext_len
+						}
+					}
+					ext_str := if ext_list.len > 0 { ext_list.join('-') } else { 'NOEXT' }
+					ja4s = 'JA4S_${version}_${cipher}_${ext_str}'
+				}
+			} else if hs_type == 0x0b {
+				certs_total_len := int((u32(buf[hs_idx + 4]) << 16) | (u32(buf[hs_idx + 5]) << 8) | u32(buf[hs_idx + 6]))
+				if certs_total_len > 0 && hs_idx + 7 + certs_total_len <= limit {
+					first_cert_len := int((u32(buf[hs_idx + 7]) << 16) | (u32(buf[hs_idx + 8]) << 8) | u32(buf[hs_idx + 9]))
+					if first_cert_len > 0 && hs_idx + 10 + first_cert_len <= limit {
+						mut hash := u32(2166136261)
+						for j := 0; j < first_cert_len; j++ {
+							hash = (hash ^ u32(buf[hs_idx + 10 + j])) * 16777619
+						}
+						cert_fp = 'CERT_${hash:08X}'
+					}
+				}
+			}
+			hs_idx += 4 + hs_len
+		}
+		idx += 5 + record_len
+	}
+	return ja4s, cert_fp
+}
+
+fn get_deep_tls_fingerprint(host string, port int) (string, string) {
+	mut conn := net.dial_tcp('${host}:${port}') or { return 'ERR_CONN', 'ERR_CONN' }
 	defer { conn.close() or {} }
 	conn.set_read_timeout(3 * time.second)
 	conn.set_write_timeout(3 * time.second)
 
 	payload := build_dynamic_client_hello(host)
-	conn.write(payload) or { return 'ERR_WRITE' }
-	
-	mut buf := []u8{len: 2048}
-	n := conn.read(mut buf) or { return 'ERR_READ' }
-	
-	if n > 45 && buf[0] == 0x16 && buf[5] == 0x02 {
-		version := '${buf[9]:02X}${buf[10]:02X}'
-		sid_len := int(buf[43])
-		cipher_idx := 44 + sid_len
-		if cipher_idx + 1 < n {
-			cipher := '${buf[cipher_idx]:02X}${buf[cipher_idx+1]:02X}'
-			mut ext_list := []string{}
-			ext_len_idx := cipher_idx + 3
-			if ext_len_idx + 1 < n {
-				ext_total_len := int((u32(buf[ext_len_idx]) << 8) | u32(buf[ext_len_idx+1]))
-				mut current_idx := ext_len_idx + 2
-				for current_idx + 3 < n && current_idx < ext_len_idx + 2 + ext_total_len {
-					ext_type := '${buf[current_idx]:02X}${buf[current_idx+1]:02X}'
-					ext_len := int((u32(buf[current_idx+2]) << 8) | u32(buf[current_idx+3]))
-					ext_list << ext_type
-					current_idx += 4 + ext_len
-				}
+	conn.write(payload) or { return 'ERR_WRITE', 'ERR_WRITE' }
+	mut buf := []u8{len: 32768}
+	mut total_read := 0
+	for total_read < 32768 {
+		mut temp := []u8{len: 4096}
+		n := conn.read(mut temp) or { break }
+		if n <= 0 { break }
+		for i in 0 .. n {
+			if total_read < 32768 {
+				buf[total_read] = temp[i]
+				total_read++
 			}
-			ext_str := if ext_list.len > 0 { ext_list.join('-') } else { 'NOEXT' }
-			return 'JA4S_${version}_${cipher}_${ext_str}'
+		}
+		if total_read >= 5 {
+			ja4s, cert_fp := parse_tls_records(buf[0..total_read], total_read)
+			if cert_fp != 'NO_CERT' {
+				return ja4s, cert_fp
+			}
 		}
 	}
-	return 'ERR_HANDSHAKE'
+	return parse_tls_records(buf[0..total_read], total_read)
 }
 
 fn resolve_host(host string) string {
@@ -198,10 +239,10 @@ fn resolve_host(host string) string {
 	return ''
 }
 
-fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, bool, int, string, u32) {
+fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, bool, int, string, u32, u16) {
 	sock := C.socket(af_inet, sock_raw, ipproto_tcp)
 	if sock < 0 {
-		return -1, -1, false, -1, 'ERR_SOCKET', 0
+		return -1, -1, false, -1, 'ERR_SOCKET', 0, 0
 	}
 	defer { C.close(sock) }
 	
@@ -227,6 +268,7 @@ fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, b
 			ip_tos := int(buf[1])
 			ip_df  := (buf[6] & 0x40) != 0
 			ip_ttl := int(buf[8])
+			ip_id  := (u16(buf[4]) << 8) | u16(buf[5])
 			
 			win_size := int((u32(buf[ihl+14]) << 8) | u32(buf[ihl+15]))
 			tcp_hdr_len := (buf[ihl+12] >> 4) * 4
@@ -262,10 +304,20 @@ fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, b
 				i += opt_len
 			}
 			tcp_fp := if opts.len > 0 { opts.join('_') } else { 'NO_OPTS' }
-			return ip_ttl, ip_tos, ip_df, win_size, tcp_fp, ts_val
+			return ip_ttl, ip_tos, ip_df, win_size, tcp_fp, ts_val, ip_id
 		}
 	}
-	return -1, -1, false, -1, 'TIMEOUT', 0
+	return -1, -1, false, -1, 'TIMEOUT', 0, 0
+}
+
+fn check_dns_poisoning() bool {
+	rand_val := time.ticks()
+	fake_host := 'env-detect-${rand_val}.nonexistent'
+	res := os.execute('ping -c 1 -W 1 ${fake_host}')
+	if res.exit_code == 0 || res.output.contains('PING') {
+		return true
+	}
+	return false
 }
 
 fn probe(host string, port int, resolved_ip string) !NetworkProfile {
@@ -279,13 +331,37 @@ fn probe(host string, port int, resolved_ip string) !NetworkProfile {
 	rtt := sw.elapsed().milliseconds()
 	conn.close() or {}
 	
-	ttl, tos, df, win_size, tcp_fingerprint, tsval := l3l4_thread.wait()
+	ttl, tos, df, win_size, tcp_fingerprint, tsval, ip_id := l3l4_thread.wait()
 	if ttl == -1 { return error('Layer 4 capture timeout') }
-	deep_ja4s := get_deep_tls_fingerprint(host, port)
+	deep_ja4s, cert_fp := get_deep_tls_fingerprint(host, port)
+	
+	mut pmtu := 1500
+	if tcp_fingerprint.contains('M') {
+		parts := tcp_fingerprint.split('M')
+		if parts.len > 1 {
+			val_str := parts[1].split('_')[0]
+			mss := val_str.int()
+			if mss > 0 {
+				pmtu = mss + 40
+			}
+		}
+	}
+	
+	dns_bad := check_dns_poisoning()
 	
 	return NetworkProfile{
-		rtt: rtt, ip_ttl: ttl, ip_tos: tos, ip_df: df,
-		tcp_win: win_size, tcp_opts: tcp_fingerprint, tcp_tsval: tsval, tls_ja4s: deep_ja4s
+		rtt: rtt
+		ip_ttl: ttl
+		ip_tos: tos
+		ip_df: df
+		ip_id: ip_id
+		tcp_win: win_size
+		tcp_opts: tcp_fingerprint
+		tcp_tsval: tsval
+		tls_ja4s: deep_ja4s
+		tls_cert: cert_fp
+		dns_bad: dns_bad
+		pmtu: pmtu
 	}
 }
 
@@ -297,7 +373,7 @@ fn main() {
 	}
 
 	println('Network Anomaly Detection & Telemetry Probe')
-	println('Version: 1.0.0-release')
+	println('Version: 1.1.0-release')
 	println('-------------------------------------------')
 
 	mut target_host := 'google.com'
@@ -315,10 +391,13 @@ fn main() {
 	
 	mut allowed_ttls := []int{}
 	mut allowed_toses := []int{}
+	mut allowed_ip_ids := []u16{}
 	mut f_win := 0
 	mut f_df := false
 	mut f_tcp_fp := ''
 	mut f_ja4s := ''
+	mut f_cert := ''
+	mut f_pmtu := 0
 	mut rtts := []i64{}
 
 	for i in 0 .. 5 {
@@ -329,14 +408,17 @@ fn main() {
 		}
 		if fp.ip_ttl !in allowed_ttls { allowed_ttls << fp.ip_ttl }
 		if fp.ip_tos !in allowed_toses { allowed_toses << fp.ip_tos }
+		if fp.ip_id !in allowed_ip_ids { allowed_ip_ids << fp.ip_id }
 		
 		f_df = fp.ip_df
 		f_win = fp.tcp_win
 		f_tcp_fp = fp.tcp_opts
 		f_ja4s = fp.tls_ja4s
+		f_cert = fp.tls_cert
+		f_pmtu = fp.pmtu
 		rtts << fp.rtt
 		
-		println('       Cycle ${i+1}: RTT=${fp.rtt}ms TTL=${fp.ip_ttl} ToS=${fp.ip_tos} TSVal=${fp.tcp_tsval}')
+		println('       Cycle ${i+1}: RTT=${fp.rtt}ms TTL=${fp.ip_ttl} ToS=${fp.ip_tos} TSVal=${fp.tcp_tsval} ID=${fp.ip_id}')
 		time.sleep(1 * time.second)
 	}
 
@@ -353,9 +435,12 @@ fn main() {
 	println('       TTL Range:     ${allowed_ttls}')
 	println('       ToS Tags:      ${allowed_toses}')
 	println('       DF Flag:       ${f_df}')
+	println('       IP ID Range:   ${allowed_ip_ids}')
 	println('       TCP Window:    ${f_win}')
 	println('       TCP Signature: ${f_tcp_fp}')
 	println('       TLS Signature: ${f_ja4s}')
+	println('       Cert Hash:     ${f_cert}')
+	println('       Path MTU:      ${f_pmtu}')
 	println('       Avg Latency:   ${base_rtt}ms\n')
 	println('[INFO] Activating continuous monitoring protocol...\n')
 
@@ -384,8 +469,10 @@ fn main() {
 		}
 
 		if curr.ip_tos !in allowed_toses {
-			score += 5
-			reasons << 'Traffic Shaping: ToS altered from ${allowed_toses} to ${curr.ip_tos}'
+			if curr.ip_tos != 0 && curr.ip_tos != 128 {
+				score += 5
+				reasons << 'Traffic Shaping: ToS altered from ${allowed_toses} to ${curr.ip_tos}'
+			}
 		}
 
 		if curr.ip_df != f_df {
@@ -406,6 +493,26 @@ fn main() {
 		if curr.tls_ja4s != f_ja4s {
 			score += 10
 			reasons << 'Crypto Signature Mismatch: Expected [${f_ja4s}], Received [${curr.tls_ja4s}]'
+		}
+
+		if curr.tls_cert != f_cert && curr.tls_cert != 'NO_CERT' && f_cert != 'NO_CERT' {
+			score += 15
+			reasons << 'MITM SSL Decryption: Certificate modified to [${curr.tls_cert}]'
+		}
+
+		if curr.dns_bad {
+			score += 15
+			reasons << 'DNS Poisoning: Non-existent domain successfully resolved'
+		}
+
+		if curr.pmtu != f_pmtu {
+			score += 8
+			reasons << 'Path MTU Modification: Expected ${f_pmtu}, Received ${curr.pmtu}'
+		}
+
+		if allowed_ip_ids.len == 1 && allowed_ip_ids[0] == 0 && curr.ip_id != 0 {
+			score += 7
+			reasons << 'IP ID Zero-to-Value Anomaly: Static zero mutated to sequential/random ID: ${curr.ip_id}'
 		}
 		
 		if base_rtt > 0 && curr.rtt > (base_rtt * 3) {
