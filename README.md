@@ -1,7 +1,7 @@
 # netprint
 
 ## Overview
-netprint is a low-level network telemetry and anomaly detection tool designed to identify environmental changes and traffic interception. It utilizes multi-layer fingerprinting to establish a deterministic baseline of a network path and monitors for deviations in real-time.
+netprint is a low-level network telemetry and anomaly detection tool designed to identify environmental changes and traffic interception. It establishes a deterministic baseline of a network path and monitors for deviations in real-time.
 
 The tool analyzes parameters across the OSI model, including Layer 3 (IP), Layer 4 (TCP), and Layer 7 (TLS), to detect routing shifts, middlebox interference, or cryptographic hijacking.
 
@@ -10,14 +10,14 @@ The tool analyzes parameters across the OSI model, including Layer 3 (IP), Layer
 ## Technical Specifications
 
 ### Fingerprinting Layers
-*   **Layer 3 (Network):** Monitors IP TTL (Time to Live) variance, ToS (Type of Service) tags, and the DF (Don't Fragment) flag status.
-*   **Layer 4 (Transport):** Analyzes TCP Window Size and stashes a complete TCP Option signature (MSS, Window Scale, SACK Permitted, Timestamps). It also tracks ECN (Explicit Congestion Notification) and CWR flags.
-*   **Layer 7 (Application):** Implements JA4S fingerprinting to identify the server-side TLS stack, cipher selection, and extension ordering.
+*   **Layer 3 (Network):** Monitors Path MTU (PMTU) shifts and performs real-time DNS resolution checks to identify redirection to private or loopback (RFC1918) networks.
+*   **Layer 4 (Transport):** Queries the Linux kernel's `tcp_info` structure via standard socket APIs. It analyzes TCP Maximum Segment Size (MSS), Kernel Peer RTT, Receiver RTT, Retransmit RTO, CWND Size, and RTT Variance. It also extracts a transport-layer options bitmask (negotiated flags such as TS, SACK, WSCALE, ECN, and TFO).
+*   **Layer 7 (Application):** Performs inline parsing of the TLS Server Hello records to extract the JA4S cryptographic fingerprint and calculates an FNV-1a hash of the server's primary SSL/TLS certificate.
 
 ### Detection Logic
-1.  **Calibration Phase:** Executes 5 initial probes to map the cluster environment. It accounts for Anycast architectures by learning valid ranges for TTL and ToS.
-2.  **Continuous Telemetry:** Monitors the live connection against the established baseline.
-3.  **Anomaly Scoring:** Assigns severity scores to deviations. High-score events trigger critical alerts indicating probable interception or infrastructure relocation.
+1.  **Calibration Phase:** Executes 10 initial measurement cycles to map the path environment, learning baseline averages and standard deviations for connection latency, handshake ratios, and transport characteristics.
+2.  **Continuous Telemetry:** Periodically probes the target in real-time to monitor for live deviations.
+3.  **Cumulative Deviation Index:** Evaluates changes against baseline tolerances. If a combination of structural shifts (e.g., latency asymmetry, altered TLS signatures, modified TCP options) crosses safe thresholds, the tool generates a detailed system path anomaly report.
 
 ---
 
@@ -29,8 +29,8 @@ pkg update -y && pkg install -y git clang make && if ! command -v v >/dev/null 2
 ---
 
 ## Requirements
-*   **Operating System:** Linux (required for raw socket support).
-*   **Privileges:** Root/Sudo access (required for `SOCK_RAW` to perform deep packet inspection).
+*   **Operating System:** Linux (required for native `tcp_info` kernel structure support).
+*   **Privileges:** Standard user privileges (root/sudo is **not** required, as it utilizes standard TCP sockets and the native `getsockopt` API instead of raw socket sniffing).
 *   **Compiler:** V programming language compiler.
 
 ---
@@ -39,30 +39,26 @@ pkg update -y && pkg install -y git clang make && if ! command -v v >/dev/null 2
 
 Compile the source code using the V compiler:
 ```bash
-v netprint.v
+v -prod netprint.v -o netprint
 ```
 
 ---
 
 ## Usage
-Run the executable with administrative privileges and specify a target host:
+Run the compiled executable directly:
 
 ```bash
-sudo ./netprint <hostname_or_ip>
+./netprint
 ```
 
-### Example
-```bash
-sudo ./netprint google.com
-```
+*Note: The target host and port are configured within the source file (`google.com:443` by default).*
 
 ---
 
 ## Log Interpretation
-*   **[INFO]:** Administrative and calibration data.
-*   **[STATUS: OK]:** All network parameters match the established baseline.
-*   **[WARN: DEVIATION]:** Minor network fluctuations (e.g., latency spikes or non-critical routing shifts).
-*   **[ALERT: CRITICAL ANOMALY]:** Significant signature mismatch. This indicates a high probability of MITM (Man-in-the-Middle) interference, kernel stack modification, or TLS termination.
+*   **[SECURE]:** All parameters, signatures, and transport latencies align with the established baseline.
+*   **[WARN: CONTEXTUAL JITTER DETECTED]:** Minor network fluctuations (e.g., transient routing delays or minor transport-layer jitter).
+*   **[!!! SYSTEM PATH ANOMALY DETECTED !!!]:** Significant structural signature mismatch. Indicates a high probability of intermediate TCP termination, TLS interception/decryption, or active local DNS spoofing.
 
 ---
 
