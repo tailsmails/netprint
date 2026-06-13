@@ -1,43 +1,54 @@
-import os
+module main
+
 import net
 import time
 import math
+import term
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/ip.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <string.h>
+#include <errno.h> 
 
 struct C.timeval {
 	tv_sec  i64
 	tv_usec i64
 }
 
-fn C.socket(domain int, type_ int, protocol int) int
-fn C.recvfrom(sock int, buf voidptr, len int, flags int, src_addr voidptr, addrlen voidptr) int
-fn C.setsockopt(sock int, level int, optname int, optval voidptr, optlen int) int
+struct C.tcp_info {
+	tcpi_pmtu       u32
+	tcpi_snd_mss    u32
+	tcpi_rtt        u32
+	tcpi_rcv_rtt    u32
+	tcpi_rto        u32
+	tcpi_snd_cwnd   u32
+	tcpi_rttvar     u32
+	tcpi_options    u8
+}
+
 fn C.close(fd int) int
-fn C.geteuid() int
+fn C.setsockopt(fd int, level int, optname int, optval &void, optlen u32) int
+fn C.getsockopt(fd int, level int, optname int, optval voidptr, optlen &u32) int
 
-const af_inet = 2
-const sock_raw = 3
-const ipproto_tcp = 6
-const sol_socket = 1
-const so_rcvtimeo = 20
-
-struct NetworkProfile {
-	rtt       i64
-	ip_ttl    int
-	ip_tos    int
-	ip_df     bool
-	ip_id     u16
-	tcp_win   int
-	tcp_opts  string
-	tcp_tsval u32
-	tls_ja4s  string
-	tls_cert  string
-	dns_bad   bool
-	pmtu      int
+struct EnvBaseline {
+mut:
+	mean_rtt       f64 
+	std_rtt        f64
+	mean_ratio     f64 
+	pmtu           u32
+	snd_mss        u32
+	kernel_rtt     u32
+	kernel_rcv_rtt u32
+	kernel_rto     u32
+	kernel_cwnd    u32
+	kernel_rttvar  u32
+	tcp_opts       u8
+	tls_ja4s       string
+	tls_cert       string
 }
 
 fn write_u16(mut arr []u8, val int) {
@@ -46,60 +57,44 @@ fn write_u16(mut arr []u8, val int) {
 }
 
 fn write_bytes(mut arr []u8, bytes []u8) {
-	for b in bytes {
-		arr << b
-	}
+	for b in bytes { arr << b }
 }
 
-fn build_dynamic_client_hello(sni string) []u8 {
+fn build_tls_client_hello(sni string) []u8 {
 	mut exts := []u8{}
-	write_u16(mut exts, 0x0000)
+	write_u16(mut exts, 0x0000) 
 	sni_bytes := sni.bytes()
 	write_u16(mut exts, sni_bytes.len + 5)
 	write_u16(mut exts, sni_bytes.len + 3)
 	exts << u8(0x00)
 	write_u16(mut exts, sni_bytes.len)
 	write_bytes(mut exts, sni_bytes)
-	write_u16(mut exts, 0x000a)
+	
+	write_u16(mut exts, 0x1a1a) 
+	write_u16(mut exts, 0)
+
+	write_u16(mut exts, 0x000a) 
 	write_u16(mut exts, 8)
 	write_u16(mut exts, 6)
 	write_u16(mut exts, 0x001d)
 	write_u16(mut exts, 0x0017)
 	write_u16(mut exts, 0x0018)
-	write_u16(mut exts, 0x000d)
+	
+	write_u16(mut exts, 0x000d) 
 	write_u16(mut exts, 10)
 	write_u16(mut exts, 8)
 	write_u16(mut exts, 0x0403)
 	write_u16(mut exts, 0x0503)
 	write_u16(mut exts, 0x0603)
 	write_u16(mut exts, 0x0804)
-	write_u16(mut exts, 0x0010)
-	write_u16(mut exts, 14)
-	write_u16(mut exts, 12)
-	exts << u8(2)
-	exts << u8(0x68)
-	exts << u8(0x32)
-	exts << u8(8)
-	exts << u8(0x68)
-	exts << u8(0x74)
-	exts << u8(0x74)
-	exts << u8(0x70)
-	exts << u8(0x2f)
-	exts << u8(0x31)
-	exts << u8(0x2e)
-	exts << u8(0x31)
 	
 	mut hs := []u8{}
-	write_u16(mut hs, 0x0303)
-	for i in 0 .. 32 {
-		hs << u8(i + 1)
-	}
+	write_u16(mut hs, 0x0303) 
+	for i in 0 .. 32 { hs << u8(i + 1) }
 	hs << u8(0x00)
-	ciphers := [0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8]
+	ciphers := [0xc02b, 0xc02f, 0xc02c, 0xc030]
 	write_u16(mut hs, ciphers.len * 2)
-	for c in ciphers {
-		write_u16(mut hs, c)
-	}
+	for c in ciphers { write_u16(mut hs, c) }
 	hs << u8(0x01)
 	hs << u8(0x00)
 	write_u16(mut hs, exts.len)
@@ -119,51 +114,31 @@ fn build_dynamic_client_hello(sni string) []u8 {
 	return record
 }
 
-fn parse_tls_records(buf []u8, n int) (string, string) {
-	mut ja4s := 'ERR_HANDSHAKE'
+fn parse_tls(buf []u8, n int) (string, string) {
+	mut ja4s := 'JA4S_ERR'
 	mut cert_fp := 'NO_CERT'
 	mut idx := 0
 	for idx + 5 <= n {
-		content_type := buf[idx]
-		if content_type != 0x16 {
-			break
-		}
+		if buf[idx] != 0x16 { break }
 		record_len := int((u32(buf[idx + 3]) << 8) | u32(buf[idx + 4]))
-		if idx + 5 + record_len > n {
-			break
-		}
+		if idx + 5 + record_len > n { break }
 		mut hs_idx := idx + 5
 		limit := idx + 5 + record_len
 		for hs_idx + 4 <= limit {
 			hs_type := buf[hs_idx]
 			hs_len := int((u32(buf[hs_idx + 1]) << 16) | (u32(buf[hs_idx + 2]) << 8) | u32(buf[hs_idx + 3]))
-			if hs_idx + 4 + hs_len > limit {
-				break
-			}
-			if hs_type == 0x02 {
+			if hs_idx + 4 + hs_len > limit { break }
+			if hs_type == 0x02 { 
 				version := '${buf[hs_idx + 4]:02X}${buf[hs_idx + 5]:02X}'
 				sid_len := int(buf[hs_idx + 38])
 				cipher_idx := hs_idx + 39 + sid_len
 				if cipher_idx + 1 < limit {
 					cipher := '${buf[cipher_idx]:02X}${buf[cipher_idx + 1]:02X}'
-					mut ext_list := []string{}
-					ext_len_idx := cipher_idx + 3
-					if ext_len_idx + 1 < limit {
-						ext_total_len := int((u32(buf[ext_len_idx]) << 8) | u32(buf[ext_len_idx + 1]))
-						mut current_idx := ext_len_idx + 2
-						for current_idx + 3 < limit && current_idx < ext_len_idx + 2 + ext_total_len {
-							ext_type := '${buf[current_idx]:02X}${buf[current_idx + 1]:02X}'
-							ext_len := int((u32(buf[current_idx + 2]) << 8) | u32(buf[current_idx + 3]))
-							ext_list << ext_type
-							current_idx += 4 + ext_len
-						}
-					}
-					ext_str := if ext_list.len > 0 { ext_list.join('-') } else { 'NOEXT' }
-					ja4s = 'JA4S_${version}_${cipher}_${ext_str}'
+					ja4s = 'JA4S_${version}_${cipher}'
 				}
-			} else if hs_type == 0x0b {
-				certs_total_len := int((u32(buf[hs_idx + 4]) << 16) | (u32(buf[hs_idx + 5]) << 8) | u32(buf[hs_idx + 6]))
-				if certs_total_len > 0 && hs_idx + 7 + certs_total_len <= limit {
+			} else if hs_type == 0x0b { 
+				certs_len := int((u32(buf[hs_idx + 4]) << 16) | (u32(buf[hs_idx + 5]) << 8) | u32(buf[hs_idx + 6]))
+				if certs_len > 0 && hs_idx + 10 <= limit {
 					first_cert_len := int((u32(buf[hs_idx + 7]) << 16) | (u32(buf[hs_idx + 8]) << 8) | u32(buf[hs_idx + 9]))
 					if first_cert_len > 0 && hs_idx + 10 + first_cert_len <= limit {
 						mut hash := u32(2166136261)
@@ -181,20 +156,77 @@ fn parse_tls_records(buf []u8, n int) (string, string) {
 	return ja4s, cert_fp
 }
 
-fn get_deep_tls_fingerprint(host string, port int) (string, string) {
-	mut conn := net.dial_tcp('${host}:${port}') or { return 'ERR_CONN', 'ERR_CONN' }
-	defer { conn.close() or {} }
-	conn.set_read_timeout(3 * time.second)
-	conn.set_write_timeout(3 * time.second)
+fn query_kernel_tcp_info(fd int) (u32, u32, u32, u32, u32, u32, u32, u8, int) {
+	info := C.tcp_info{}
+	mut len := u32(sizeof(C.tcp_info))
+	
+	// IPPROTO_TCP = 6 , TCP_INFO = 11
+	res := C.getsockopt(fd, 6, 11, &info, &len)
+	if res == 0 {
+		return info.tcpi_pmtu, info.tcpi_snd_mss, info.tcpi_rtt, info.tcpi_rcv_rtt, info.tcpi_rto, info.tcpi_snd_cwnd, info.tcpi_rttvar, info.tcpi_options, 0
+	} else {
+		return 0, 0, 0, 0, 0, 0, 0, 0, int(C.errno)
+	}
+}
 
-	payload := build_dynamic_client_hello(host)
-	conn.write(payload) or { return 'ERR_WRITE', 'ERR_WRITE' }
+fn parse_tcp_options(opts u8) string {
+	mut active := []string{}
+	if (opts & 1) != 0 { active << 'TS' }      // Timestamps
+	if (opts & 2) != 0 { active << 'SACK' }    // Selective ACK
+	if (opts & 4) != 0 { active << 'WSCALE' }  // Window Scale
+	if (opts & 8) != 0 { active << 'ECN' }     // Explicit Congestion Notification
+	if (opts & 16) != 0 { active << 'ECN_SEEN'} // ECN Seen
+	if (opts & 32) != 0 { active << 'TFO' }    // TCP Fast Open
+	if active.len == 0 { return 'NONE' }
+	return active.join('+')
+}
+
+fn is_private_ip(ip string) bool {
+	parts := ip.split('.')
+	if parts.len != 4 { return false }
+	p0 := parts[0].int()
+	p1 := parts[1].int()
+	if p0 == 10 { return true }
+	if p0 == 172 && p1 >= 16 && p1 <= 31 { return true }
+	if p0 == 192 && p1 == 168 { return true }
+	if p0 == 127 { return true }
+	if p0 == 0 { return true }
+	return false
+}
+
+fn probe_environment(host string, port int) !(f64, f64, u32, u32, u32, u32, u32, u32, u32, u8, int, string, string, string) {
+	addrs := net.resolve_addrs_fuzzy(host, .tcp)!
+	if addrs.len == 0 { return error('DNS resolution is empty') }
+	current_ip := addrs[0].str().split(':')[0]
+
+	mut sw := time.new_stopwatch()
+	mut conn := net.dial_tcp('${current_ip}:${port}')!
+	rtt_tcp := f64(sw.elapsed().microseconds()) / 1000.0 
+	conn.close() or {}
+	
+	mut conn_tls := net.dial_tcp('${current_ip}:${port}')!
+	conn_tls.set_read_timeout(3 * time.second)
+	
+	payload := build_tls_client_hello(host)
+	
+	sw.restart()
+	conn_tls.write(payload) or {}
+	
 	mut buf := []u8{len: 32768}
 	mut total_read := 0
+	mut ja4s := 'JA4S_ERR'
+	mut cert := 'NO_CERT'
+	mut rtt_tls := 0.0
+	
 	for total_read < 32768 {
 		mut temp := []u8{len: 4096}
-		n := conn.read(mut temp) or { break }
+		n := conn_tls.read(mut temp) or { break }
 		if n <= 0 { break }
+		
+		if total_read == 0 {
+			rtt_tls = f64(sw.elapsed().microseconds()) / 1000.0
+		}
+		
 		for i in 0 .. n {
 			if total_read < 32768 {
 				buf[total_read] = temp[i]
@@ -202,337 +234,197 @@ fn get_deep_tls_fingerprint(host string, port int) (string, string) {
 			}
 		}
 		if total_read >= 5 {
-			ja4s, cert_fp := parse_tls_records(buf[0..total_read], total_read)
-			if cert_fp != 'NO_CERT' {
-				return ja4s, cert_fp
+			j_parsed, c_parsed := parse_tls(buf[0..total_read], total_read)
+			if c_parsed != 'NO_CERT' {
+				ja4s = j_parsed
+				cert = c_parsed
+				break 
 			}
+			ja4s = j_parsed
 		}
 	}
-	return parse_tls_records(buf[0..total_read], total_read)
-}
 
-fn resolve_host(host string) string {
-	parts := host.split('.')
-	if parts.len == 4 {
-		mut is_ip := true
-		for p in parts {
-			if p.int() < 0 || p.int() > 255 {
-				is_ip = false
-			}
-		}
-		if is_ip {
-			return host
-		}
-	}
-	res := os.execute('ping -c 1 -W 2 ${host}')
-	for line in res.output.split('\n') {
-		if line.contains('PING') {
-			p1 := line.split('(')
-			if p1.len > 1 {
-				p2 := p1[1].split(')')
-				if p2.len > 0 {
-					return p2[0]
-				}
-			}
-		}
-	}
-	return ''
-}
-
-fn capture_deep_packet_signature(target_ip string, target_port int) (int, int, bool, int, string, u32, u16) {
-	sock := C.socket(af_inet, sock_raw, ipproto_tcp)
-	if sock < 0 {
-		return -1, -1, false, -1, 'ERR_SOCKET', 0, 0
-	}
-	defer { C.close(sock) }
+	pmtu, mss, k_rtt, k_rcv_rtt, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code := query_kernel_tcp_info(conn_tls.sock.handle)
 	
-	tv := C.timeval{tv_sec: 2, tv_usec: 0}
-	C.setsockopt(sock, sol_socket, so_rcvtimeo, &tv, sizeof(C.timeval))
-	mut buf := []u8{len: 2048}
+	conn_tls.close() or {}
 	
-	for {
-		n := C.recvfrom(sock, buf.data, 2048, 0, C.NULL, C.NULL)
-		if n < 40 { break }
-		
-		ihl := (buf[0] & 0x0F) * 4
-		if ihl < 20 || ihl + 20 > n { continue }
-		
-		src_ip := '${buf[12]}.${buf[13]}.${buf[14]}.${buf[15]}'
-		if src_ip != target_ip { continue }
-		
-		src_p := int((u32(buf[ihl]) << 8) | u32(buf[ihl+1]))
-		if src_p != target_port { continue }
-		
-		flags := buf[ihl+13]
-		if (flags & 0x12) == 0x12 {
-			ip_tos := int(buf[1])
-			ip_df  := (buf[6] & 0x40) != 0
-			ip_ttl := int(buf[8])
-			ip_id  := (u16(buf[4]) << 8) | u16(buf[5])
-			
-			win_size := int((u32(buf[ihl+14]) << 8) | u32(buf[ihl+15]))
-			tcp_hdr_len := (buf[ihl+12] >> 4) * 4
-			
-			mut opts := []string{}
-			mut ts_val := u32(0)
-			
-			if (flags & 0x40) != 0 { opts << 'E' }
-			if (flags & 0x80) != 0 { opts << 'C' }
-
-			mut i := ihl + 20
-			for i < ihl + tcp_hdr_len && i < n {
-				opt_kind := buf[i]
-				if opt_kind == 0 { break }
-				if opt_kind == 1 {
-					i++
-					continue
-				}
-				opt_len := buf[i+1]
-				if opt_len < 2 { break }
-				
-				if opt_kind == 2 && opt_len == 4 {
-					mss := int((u32(buf[i+2]) << 8) | u32(buf[i+3]))
-					opts << 'M${mss}'
-				} else if opt_kind == 3 && opt_len == 3 {
-					opts << 'W${buf[i+2]}'
-				} else if opt_kind == 4 {
-					opts << 'S'
-				} else if opt_kind == 8 && opt_len == 10 {
-					opts << 'T'
-					ts_val = (u32(buf[i+2]) << 24) | (u32(buf[i+3]) << 16) | (u32(buf[i+4]) << 8) | u32(buf[i+5])
-				}
-				i += opt_len
-			}
-			tcp_fp := if opts.len > 0 { opts.join('_') } else { 'NO_OPTS' }
-			return ip_ttl, ip_tos, ip_df, win_size, tcp_fp, ts_val, ip_id
-		}
-	}
-	return -1, -1, false, -1, 'TIMEOUT', 0, 0
-}
-
-fn check_dns_poisoning() bool {
-	rand_val := time.ticks()
-	fake_host := 'o${rand_val}.com'
-	res := os.execute('ping -c 1 -W 1 ${fake_host}')
-	if res.exit_code == 0 || res.output.contains('PING') {
-		return true
-	}
-	return false
-}
-
-fn probe(host string, port int, resolved_ip string) !NetworkProfile {
-	if resolved_ip == '' { return error('DNS resolution failed') }
-	
-	l3l4_thread := spawn capture_deep_packet_signature(resolved_ip, port)
-	time.sleep(100 * time.millisecond)
-	
-	mut sw := time.new_stopwatch()
-	mut conn := net.dial_tcp('${host}:${port}') or { return error('Connection refused or blocked') }
-	rtt := sw.elapsed().milliseconds()
-	conn.close() or {}
-	
-	ttl, tos, df, win_size, tcp_fingerprint, tsval, ip_id := l3l4_thread.wait()
-	if ttl == -1 { return error('Layer 4 capture timeout') }
-	deep_ja4s, cert_fp := get_deep_tls_fingerprint(host, port)
-	
-	mut pmtu := 1500
-	if tcp_fingerprint.contains('M') {
-		parts := tcp_fingerprint.split('M')
-		if parts.len > 1 {
-			val_str := parts[1].split('_')[0]
-			mss := val_str.int()
-			if mss > 0 {
-				pmtu = mss + 40
-			}
-		}
-	}
-	
-	dns_bad := check_dns_poisoning()
-	
-	return NetworkProfile{
-		rtt: rtt
-		ip_ttl: ttl
-		ip_tos: tos
-		ip_df: df
-		ip_id: ip_id
-		tcp_win: win_size
-		tcp_opts: tcp_fingerprint
-		tcp_tsval: tsval
-		tls_ja4s: deep_ja4s
-		tls_cert: cert_fp
-		dns_bad: dns_bad
-		pmtu: pmtu
-	}
+	return rtt_tcp, rtt_tls, pmtu, mss, k_rtt, k_rcv_rtt, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, current_ip
 }
 
 fn main() {
-	if C.geteuid() != 0 {
-		eprintln('[FATAL] Root privileges required for raw socket access.')
-		eprintln('[FATAL] Please run the executable with sudo.')
-		exit(1)
-	}
+	println(term.bold('= NetPrint ='))
 
-	println('Network Anomaly Detection & Telemetry Probe')
-	println('Version: 1.1.0-release')
-	println('-------------------------------------------')
-
-	mut target_host := 'google.com'
+	target_host := 'google.com'
 	target_port := 443
-	if os.args.len > 1 { target_host = os.args[1] }
 
-	resolved_ip := resolve_host(target_host)
-	if resolved_ip == '' {
-		eprintln('[FATAL] DNS resolution failed for target: ${target_host}')
+	println('[*] Performing pre-flight DNS validation...')
+	_ := net.resolve_addrs_fuzzy(target_host, .tcp) or {
+		eprintln(term.red('[FATAL] DNS resolution failed. Check your network adapter.'))
 		exit(1)
 	}
 
-	println('[INFO] Target mapping: ${target_host} -> ${resolved_ip}:${target_port}')
-	println('[INFO] Initiating baseline calibration (5 cycles)...')
-	
-	mut allowed_ttls := []int{}
-	mut allowed_toses := []int{}
-	mut allowed_ip_ids := []u16{}
-	mut f_win := 0
-	mut f_df := false
-	mut f_tcp_fp := ''
-	mut f_ja4s := ''
-	mut f_cert := ''
-	mut f_pmtu := 0
-	mut rtts := []i64{}
+	println('[*] Running 10-Cycle Calibration...')
+	mut rtts := []f64{}
+	mut ratios := []f64{}
+	mut pmtus := []u32{}
+	mut msses := []u32{}
+	mut k_rtts := []u32{}
+	mut k_rcv_rtts := []u32{}
+	mut k_rtos := []u32{}
+	mut k_cwnds := []u32{}
+	mut k_rttvars := []u32{}
+	mut k_tcp_opts := []u8{}
+	mut final_ja4s := ''
+	mut final_cert := ''
 
-	for i in 0 .. 5 {
-		fp := probe(target_host, target_port, resolved_ip) or {
-			eprintln('[WARN] Cycle ${i+1} failed: ${err}')
-			time.sleep(1 * time.second)
+	for i in 0 .. 10 {
+		rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, _ := probe_environment(target_host, target_port) or {
+			eprintln(term.yellow('[WARN] Cycle ${i+1} dropped. Retrying...'))
+			time.sleep(500 * time.millisecond)
 			continue
 		}
-		if fp.ip_ttl !in allowed_ttls { allowed_ttls << fp.ip_ttl }
-		if fp.ip_tos !in allowed_toses { allowed_toses << fp.ip_tos }
-		if fp.ip_id !in allowed_ip_ids { allowed_ip_ids << fp.ip_id }
-		
-		f_df = fp.ip_df
-		f_win = fp.tcp_win
-		f_tcp_fp = fp.tcp_opts
-		f_ja4s = fp.tls_ja4s
-		f_cert = fp.tls_cert
-		f_pmtu = fp.pmtu
-		rtts << fp.rtt
-		
-		println('       Cycle ${i+1}: RTT=${fp.rtt}ms TTL=${fp.ip_ttl} ToS=${fp.ip_tos} TSVal=${fp.tcp_tsval} ID=${fp.ip_id}')
-		time.sleep(1 * time.second)
+		if err_code != 0 {
+			eprintln(term.red('[DEBUG] getsockopt failed with errno: ${err_code}'))
+		}
+		rtts << rtt_tcp
+		if rtt_tcp > 0 { ratios << (rtt_tls / rtt_tcp) }
+		if pmtu > 0 { pmtus << pmtu }
+		if mss > 0 { msses << mss }
+		if k_r > 0 { k_rtts << k_r }
+		if k_rcv > 0 { k_rcv_rtts << k_rcv }
+		if k_rto > 0 { k_rtos << k_rto }
+		if k_cwnd > 0 { k_cwnds << k_cwnd }
+		if k_rttvar > 0 { k_rttvars << k_rttvar }
+		if tcp_opts > 0 { k_tcp_opts << tcp_opts }
+		final_ja4s = ja4s
+		final_cert = cert
+		time.sleep(200 * time.millisecond)
 	}
 
-	if allowed_ttls.len == 0 {
-		eprintln('[FATAL] Baseline calibration failed. Network unreachable.')
+	if rtts.len < 5 {
+		eprintln(term.red('[FATAL] Inadequate calibration samples collected. Aborting.'))
 		exit(1)
 	}
 
-	mut sum_rtt := i64(0)
-	for r_val in rtts { sum_rtt += r_val }
-	base_rtt := sum_rtt / i64(rtts.len)
+	mut sum_rtt := 0.0
+	for r in rtts { sum_rtt += r }
+	mean_rtt := sum_rtt / f64(rtts.len)
 
-	println('\n[INFO] Baseline profile established successfully:')
-	println('       TTL Range:     ${allowed_ttls}')
-	println('       ToS Tags:      ${allowed_toses}')
-	println('       DF Flag:       ${f_df}')
-	println('       IP ID Range:   ${allowed_ip_ids}')
-	println('       TCP Window:    ${f_win}')
-	println('       TCP Signature: ${f_tcp_fp}')
-	println('       TLS Signature: ${f_ja4s}')
-	println('       Cert Hash:     ${f_cert}')
-	println('       Path MTU:      ${f_pmtu}')
-	println('       Avg Latency:   ${base_rtt}ms\n')
-	println('[INFO] Activating continuous monitoring protocol...\n')
+	mut sum_sq_diff := 0.0
+	for r in rtts { sum_sq_diff += math.pow(r - mean_rtt, 2) }
+	std_rtt := math.sqrt(sum_sq_diff / f64(rtts.len))
+
+	mut sum_ratio := 0.0
+	for rat in ratios { sum_ratio += rat }
+	mean_ratio := sum_ratio / f64(ratios.len)
+
+	base_pmtu := if pmtus.len > 0 { pmtus[pmtus.len - 1] } else { u32(1500) }
+	base_mss := if msses.len > 0 { msses[msses.len - 1] } else { u32(1460) }
+	base_k_rtt := if k_rtts.len > 0 { k_rtts[k_rtts.len - 1] } else { u32(0) }
+	base_k_rcv := if k_rcv_rtts.len > 0 { k_rcv_rtts[k_rcv_rtts.len - 1] } else { u32(0) }
+	base_k_rto := if k_rtos.len > 0 { k_rtos[k_rtos.len - 1] } else { u32(0) }
+	base_k_cwnd := if k_cwnds.len > 0 { k_cwnds[k_cwnds.len - 1] } else { u32(0) }
+	base_k_rttvar := if k_rttvars.len > 0 { k_rttvars[k_rttvars.len - 1] } else { u32(0) }
+	base_tcp_opts := if k_tcp_opts.len > 0 { k_tcp_opts[k_tcp_opts.len - 1] } else { u8(0) }
+
+	baseline := EnvBaseline{
+		mean_rtt: mean_rtt
+		std_rtt: std_rtt
+		mean_ratio: mean_ratio
+		pmtu: base_pmtu
+		snd_mss: base_mss
+		kernel_rtt: base_k_rtt
+		kernel_rcv_rtt: base_k_rcv
+		kernel_rto: base_k_rto
+		kernel_cwnd: base_k_cwnd
+		kernel_rttvar: base_k_rttvar
+		tcp_opts: base_tcp_opts
+		tls_ja4s: final_ja4s
+		tls_cert: final_cert
+	}
+
+	println('\n' + term.bold(term.green('[+] Side-Channel Calibration Complete:')))
+	println('    TCP Connect RTT:  ${term.cyan('${baseline.mean_rtt:.2f} ms')} (StdDev: ${term.gray('${baseline.std_rtt:.2f}')})')
+	println('    Handshake Ratio:  ${term.cyan('${baseline.mean_ratio:.3f}x')} (TLS/TCP delay ratio)')
+	println('    Kernel Peer RTT:  ${term.cyan('${(f64(baseline.kernel_rtt)/1000.0):.2f} ms')}')
+	println('    Receiver RTT:     ${term.cyan('${(f64(baseline.kernel_rcv_rtt)/1000.0):.2f} ms')}')
+	println('    Retransmit RTO:   ${term.cyan('${(f64(baseline.kernel_rto)/1000.0):.2f} ms')}')
+	println('    Kernel CWND Size: ${term.cyan('${baseline.kernel_cwnd}')}')
+	println('    Kernel RTT Var:   ${term.cyan('${(f64(baseline.kernel_rttvar)/1000.0):.2f} ms')}')
+	println('    Path MTU:         ${term.cyan('${baseline.pmtu} bytes')} | MSS: ${term.cyan('${baseline.snd_mss} bytes')}')
+	println('    TCP Options:      ${term.cyan(parse_tcp_options(baseline.tcp_opts))}')
+	println('    JA4S Fingerprint: ${term.yellow(baseline.tls_ja4s)}')
+	println('    Cert Signature:   ${term.yellow(baseline.tls_cert)}\n')
+	println(term.gray('[*] Integrity lock engaged. Continuous passive scanning active...'))
 
 	for {
-		time.sleep(4 * time.second)
+		time.sleep(3 * time.second)
 		
-		curr := probe(target_host, target_port, resolved_ip) or {
-			now := time.now().format_ss()
-			println('[${now}] [WARN: PROBE DROPPED] Network connectivity loss or probe timeout.')
-			continue 
+		rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, _, tcp_opts, err_code, ja4s, cert, current_ip := probe_environment(target_host, target_port) or {
+			println(term.yellow('[!] Socket session dropped (Transient network jitter or packet rejection)'))
+			continue
 		}
-		
-		mut score := 0
+		if err_code != 0 {
+			println(term.red('[DEBUG] runtime getsockopt failed with errno: ${err_code}'))
+		}
+
+		mut anomaly_score := 0
 		mut reasons := []string{}
-		
-		mut is_ttl_ok := false
-		for t in allowed_ttls {
-			if math.abs(t - curr.ip_ttl) <= 2 {
-				is_ttl_ok = true
-				break
+
+		current_ratio := if rtt_tcp > 0 { rtt_tls / rtt_tcp } else { 1.0 }
+		if rtt_tcp < 4.0 && current_ratio > (baseline.mean_ratio * 3.5) && rtt_tls > 30.0 {
+			anomaly_score += 45
+			reasons << 'Latency Asymmetry Detected: Ultra-low TCP connection RTT (${rtt_tcp:.1f}ms) with high TLS handshake RTT (${rtt_tls:.1f}ms). Handshake delay ratio: ${current_ratio:.1f}x (Expected: ${baseline.mean_ratio:.1f}x). Strong indicator of early TCP termination proxy.'
+		}
+
+		if pmtu != 0 && baseline.pmtu != 0 && pmtu != baseline.pmtu {
+			anomaly_score += 25
+			reasons << 'Path MTU Shift: PMTU migrated from ${baseline.pmtu} to ${pmtu}. Indicates active path re-routing or packet resizing by inline network hardware.'
+		}
+		if mss != 0 && baseline.snd_mss != 0 && mss != baseline.snd_mss {
+			anomaly_score += 20
+			reasons << 'Segment Size Shift: MSS mutated from ${baseline.snd_mss} to ${mss}. Probable TCP header rewriting or segment-level middlebox intervention.'
+		}
+
+		if k_rcv > 0 && baseline.kernel_rcv_rtt > 0 {
+			rcv_diff := math.abs(f64(k_rcv) - f64(baseline.kernel_rcv_rtt)) / 1000.0
+			if rcv_diff > 150.0 && rtt_tcp < 10.0 {
+				anomaly_score += 15
+				reasons << 'Receiver RTT Drift: Kernel tcpi_rcv_rtt deviated by ${rcv_diff:.1f}ms on local routing, indicating delayed ACK handling by the peer.'
 			}
 		}
-		if !is_ttl_ok {
-			score += 10
-			reasons << 'Routing Variance: TTL ${curr.ip_ttl} falls outside baseline ${allowed_ttls}'
+
+		if tcp_opts != 0 && baseline.tcp_opts != 0 && tcp_opts != baseline.tcp_opts {
+			anomaly_score += 30
+			reasons << 'TCP Options Mismatch: Negotiated options shifted from ${parse_tcp_options(baseline.tcp_opts)} to ${parse_tcp_options(tcp_opts)}. Indicates a transport-layer rewriting proxy.'
 		}
 
-		if curr.ip_tos !in allowed_toses {
-			if curr.ip_tos != 0 && curr.ip_tos != 128 {
-				score += 5
-				reasons << 'Traffic Shaping: ToS altered from ${allowed_toses} to ${curr.ip_tos}'
-			}
+		if ja4s != baseline.tls_ja4s {
+			anomaly_score += 35
+			reasons << 'TLS Fingerprint Mismatch: Cryptographic handshake signature altered. Expected: ${baseline.tls_ja4s}, Got: ${ja4s}. Indicates downstream TLS protocol renegotiation.'
+		}
+		if cert != baseline.tls_cert && cert != 'NO_CERT' && baseline.tls_cert != 'NO_CERT' {
+			anomaly_score += 50
+			reasons << 'TLS Certificate Mismatch: Handshake returned an altered certificate hash (Expected: ${baseline.tls_cert}, Got: ${cert}). Highly indicative of active SSL/TLS interception/decryption proxy.'
 		}
 
-		if curr.ip_df != f_df {
-			score += 8
-			reasons << 'Encapsulation Anomaly: DF flag mutated (Expected: ${f_df}, Received: ${curr.ip_df})'
-		}
-		
-		if curr.tcp_win != f_win && !curr.tcp_opts.contains('ERR_') {
-			score += 4
-			reasons << 'L4 Window Discrepancy: Mutated from ${f_win} to ${curr.tcp_win}'
-		}
-
-		if curr.tcp_opts != f_tcp_fp && !curr.tcp_opts.contains('ERR_') {
-			score += 10
-			reasons << 'Kernel Stack Modification: Expected [${f_tcp_fp}], Received [${curr.tcp_opts}]'
-		}
-		
-		if curr.tls_ja4s != f_ja4s {
-			score += 10
-			reasons << 'Crypto Signature Mismatch: Expected [${f_ja4s}], Received [${curr.tls_ja4s}]'
-		}
-
-		if curr.tls_cert != f_cert && curr.tls_cert != 'NO_CERT' && f_cert != 'NO_CERT' {
-			score += 15
-			reasons << 'MITM SSL Decryption: Certificate modified to [${curr.tls_cert}]'
-		}
-
-		if curr.dns_bad {
-			score += 15
-			reasons << 'DNS Poisoning: Non-existent domain successfully resolved'
-		}
-
-		if curr.pmtu != f_pmtu {
-			score += 8
-			reasons << 'Path MTU Modification: Expected ${f_pmtu}, Received ${curr.pmtu}'
-		}
-
-		if allowed_ip_ids.len == 1 && allowed_ip_ids[0] == 0 && curr.ip_id != 0 {
-			score += 7
-			reasons << 'IP ID Zero-to-Value Anomaly: Static zero mutated to sequential/random ID: ${curr.ip_id}'
-		}
-		
-		if base_rtt > 0 && curr.rtt > (base_rtt * 3) {
-			score += 2
-			reasons << 'Latency Spike Detected: ${curr.rtt}ms (Baseline: ${base_rtt}ms)'
+		if is_private_ip(current_ip) {
+			anomaly_score += 50
+			reasons << 'DNS Resolution Divergence: Host resolved to a private/loopback RFC1918 address [${current_ip}]. Indicates local DNS spoofing or routing hijack.'
 		}
 
 		now_str := time.now().format_ss()
-		
-		if score == 0 {
-			println('[${now_str}] [STATUS: OK] RTT:${curr.rtt}ms TTL:${curr.ip_ttl} ToS:${curr.ip_tos} WIN:${curr.tcp_win}')
-		} else if score >= 8 {
-			println('\n[${now_str}] [ALERT: CRITICAL ANOMALY DETECTED]')
-			println(' -> Profile Integrity Score: -${score}')
+		if anomaly_score == 0 {
+			println('[${now_str}] ${term.green('[SECURE]')} RTT-TCP:${rtt_tcp:.1f}ms | Ratio:${current_ratio:.2f}x | k_RTT:${(f64(k_r)/1000.0):.2f}ms | k_RTO:${(f64(k_rto)/1000.0):.1f}ms | CWND:${k_cwnd} | TCP-Opts:${parse_tcp_options(tcp_opts)}')
+		} else if anomaly_score >= 40 {
+			println('\n[${now_str}] ${term.bold(term.red('[!!! SYSTEM PATH ANOMALY DETECTED !!!]'))}')
+			println(' -> Cumulative Deviation Index: ${term.red('-${anomaly_score}')}')
 			for r in reasons {
-				println(' -> ${r}')
+				println(' -> ${term.yellow(r)}')
 			}
-			println('--------------------------------------------------\n')
+			println('===========================================================\n')
 		} else {
-			println('[${now_str}] [WARN: MINOR DEVIATION] Reason: ${reasons[0]}')
+			println('[${now_str}] ${term.yellow('[WARN: CONTEXTUAL JITTER DETECTED]')} -> ${reasons[0]}')
 		}
 	}
 }
