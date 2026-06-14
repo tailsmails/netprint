@@ -312,7 +312,7 @@ fn main() {
 	mut targets := []string{}
 
 	if os.args.len > 1 {
-		targets = os.args[1..]
+		targets = os.args[1..].clone()
 	} else {
 		println('[*] No CLI targets provided.')
 		input := os.input('[?] Enter targets separated by spaces (e.g. google.com cloudflare.com):\n> ')
