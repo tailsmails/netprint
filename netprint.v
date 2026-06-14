@@ -5,6 +5,7 @@ import time
 import math
 import term
 import os
+import rand
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -62,8 +63,23 @@ fn write_bytes(mut arr []u8, bytes []u8) {
 }
 
 fn build_tls_client_hello(sni string) []u8 {
+	grease_values := [
+		0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+		0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa
+	]
+	
+	grease_cipher_idx := rand.intn(grease_values.len) or { 0 }
+	grease_cipher := grease_values[grease_cipher_idx]
+
+	grease_ext_idx := rand.intn(grease_values.len) or { 1 }
+	grease_ext := grease_values[grease_ext_idx]
+
 	mut exts := []u8{}
+	
+	write_u16(mut exts, grease_ext)
 	write_u16(mut exts, 0x0000) 
+	
+	write_u16(mut exts, 0x0000)
 	sni_bytes := sni.bytes()
 	write_u16(mut exts, sni_bytes.len + 5)
 	write_u16(mut exts, sni_bytes.len + 3)
@@ -71,44 +87,83 @@ fn build_tls_client_hello(sni string) []u8 {
 	write_u16(mut exts, sni_bytes.len)
 	write_bytes(mut exts, sni_bytes)
 	
-	write_u16(mut exts, 0x1a1a) 
-	write_u16(mut exts, 0)
-
-	write_u16(mut exts, 0x000a) 
-	write_u16(mut exts, 8)
-	write_u16(mut exts, 6)
-	write_u16(mut exts, 0x001d)
 	write_u16(mut exts, 0x0017)
-	write_u16(mut exts, 0x0018)
+	write_u16(mut exts, 0x0000)
 	
-	write_u16(mut exts, 0x000d) 
-	write_u16(mut exts, 10)
-	write_u16(mut exts, 8)
-	write_u16(mut exts, 0x0403)
-	write_u16(mut exts, 0x0503)
-	write_u16(mut exts, 0x0603)
-	write_u16(mut exts, 0x0804)
+	write_u16(mut exts, 0xff01)
+	write_u16(mut exts, 0x0001)
+	exts << u8(0x00)
+	
+	write_u16(mut exts, 0x000a)
+	write_u16(mut exts, 0x0008)
+	write_u16(mut exts, 0x0006)
+	write_u16(mut exts, 0x001d) // Curve25519 (X25519)
+	write_u16(mut exts, 0x0017) // secp256r1
+	write_u16(mut exts, 0x0018) // secp384r1
+	
+	write_u16(mut exts, 0x000b)
+	write_u16(mut exts, 0x0002)
+	exts << u8(0x01)
+	exts << u8(0x00) // Uncompressed point format
+	
+	write_u16(mut exts, 0x000d)
+	write_u16(mut exts, 18)
+	write_u16(mut exts, 16)
+	write_u16(mut exts, 0x0403) // ecdsa_secp256r1_sha256
+	write_u16(mut exts, 0x0503) // ecdsa_secp384r1_sha384
+	write_u16(mut exts, 0x0603) // ecdsa_secp512r1_sha512
+	write_u16(mut exts, 0x0804) // rsa_pss_rsae_sha256
+	write_u16(mut exts, 0x0805) // rsa_pss_rsae_sha384
+	write_u16(mut exts, 0x0806) // rsa_pss_rsae_sha512
+	write_u16(mut exts, 0x0401) // rsa_pkcs1_sha256
+	write_u16(mut exts, 0x0501) // rsa_pkcs1_sha384
+	
+	write_u16(mut exts, 0x0010)
+	write_u16(mut exts, 14)
+	write_u16(mut exts, 12)
+	exts << u8(0x02)
+	write_bytes(mut exts, 'h2'.bytes())
+	exts << u8(0x08)
+	write_bytes(mut exts, 'http/1.1'.bytes())
 	
 	mut hs := []u8{}
-	write_u16(mut hs, 0x0303) 
-	for i in 0 .. 32 { hs << u8(i + 1) }
-	hs << u8(0x00)
-	ciphers := [0xc02b, 0xc02f, 0xc02c, 0xc030]
+	write_u16(mut hs, 0x0303) // TLS 1.2
+	
+	for i in 0 .. 32 { 
+		hs << u8((i * 13 + 47) & 0xff) 
+	}
+	
+	hs << u8(0x20)
+	for i in 0 .. 32 { 
+		hs << u8((i * 17 + 29) & 0xff) 
+	}
+	
+	ciphers := [
+		u16(grease_cipher),
+		0x1301, 0x1302, 0x1303, // TLS 1.3 Cipher Suites
+		0xc02b, 0xc02f, 0xc02c, 0xc030,
+		0xcca9, 0xcca8,
+		0x009c, 0x009d
+	]
 	write_u16(mut hs, ciphers.len * 2)
-	for c in ciphers { write_u16(mut hs, c) }
-	hs << u8(0x01)
+	for c in ciphers { 
+		write_u16(mut hs, int(c)) 
+	}
+	
+	hs << u8(0x01) // Compression method: NULL
 	hs << u8(0x00)
+	
 	write_u16(mut hs, exts.len)
 	write_bytes(mut hs, exts)
 	
 	mut hs_hdr := []u8{}
-	hs_hdr << u8(0x01)
+	hs_hdr << u8(0x01) // Handshake Type: Client Hello
 	hs_hdr << u8(hs.len >> 16)
 	write_u16(mut hs_hdr, hs.len & 0xffff)
 	write_bytes(mut hs_hdr, hs)
 	
 	mut record := []u8{}
-	record << u8(0x16)
+	record << u8(0x16) // TLS Record Handshake Type
 	write_u16(mut record, 0x0301)
 	write_u16(mut record, hs_hdr.len)
 	write_bytes(mut record, hs_hdr)
@@ -255,7 +310,7 @@ fn main() {
 	println(term.bold('= NetPrint ='))
 
 	mut targets := []string{}
-	
+
 	if os.args.len > 1 {
 		targets = os.args[1..]
 	} else {
@@ -278,7 +333,7 @@ fn main() {
 	target_port := 443
 
 	mut baselines := map[string]EnvBaseline{}
-	
+
 	for target in targets {
 		println('\n' + term.bold('[*] Performing pre-flight DNS validation for ${target}...'))
 		_ := net.resolve_addrs_fuzzy(target, .tcp) or {
@@ -388,7 +443,8 @@ fn main() {
 	println(term.gray('[*] Integrity lock engaged. Continuous passive scanning active...'))
 
 	for {
-		time.sleep(3 * time.second)
+		jitter_ms := rand.int_in_range(2000, 5001) or { 3000 }
+		time.sleep(jitter_ms * time.millisecond)
 		
 		for target, baseline in baselines {
 			rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, _, tcp_opts, err_code, ja4s, cert, current_ip := probe_environment(target, target_port) or {
