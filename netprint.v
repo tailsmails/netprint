@@ -4,6 +4,7 @@ import net
 import time
 import math
 import term
+import os
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -160,7 +161,6 @@ fn query_kernel_tcp_info(fd int) (u32, u32, u32, u32, u32, u32, u32, u8, int) {
 	info := C.tcp_info{}
 	mut len := u32(sizeof(C.tcp_info))
 	
-	// IPPROTO_TCP = 6 , TCP_INFO = 11
 	res := C.getsockopt(fd, 6, 11, &info, &len)
 	if res == 0 {
 		return info.tcpi_pmtu, info.tcpi_snd_mss, info.tcpi_rtt, info.tcpi_rcv_rtt, info.tcpi_rto, info.tcpi_snd_cwnd, info.tcpi_rttvar, info.tcpi_options, 0
@@ -171,12 +171,12 @@ fn query_kernel_tcp_info(fd int) (u32, u32, u32, u32, u32, u32, u32, u8, int) {
 
 fn parse_tcp_options(opts u8) string {
 	mut active := []string{}
-	if (opts & 1) != 0 { active << 'TS' }      // Timestamps
-	if (opts & 2) != 0 { active << 'SACK' }    // Selective ACK
-	if (opts & 4) != 0 { active << 'WSCALE' }  // Window Scale
-	if (opts & 8) != 0 { active << 'ECN' }     // Explicit Congestion Notification
-	if (opts & 16) != 0 { active << 'ECN_SEEN'} // ECN Seen
-	if (opts & 32) != 0 { active << 'TFO' }    // TCP Fast Open
+	if (opts & 1) != 0 { active << 'TS' }      
+	if (opts & 2) != 0 { active << 'SACK' }    
+	if (opts & 4) != 0 { active << 'WSCALE' }  
+	if (opts & 8) != 0 { active << 'ECN' }     
+	if (opts & 16) != 0 { active << 'ECN_SEEN'} 
+	if (opts & 32) != 0 { active << 'TFO' }    
 	if active.len == 0 { return 'NONE' }
 	return active.join('+')
 }
@@ -244,187 +244,219 @@ fn probe_environment(host string, port int) !(f64, f64, u32, u32, u32, u32, u32,
 		}
 	}
 
-	pmtu, mss, k_rtt, k_rcv_rtt, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code := query_kernel_tcp_info(conn_tls.sock.handle)
+	pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code := query_kernel_tcp_info(conn_tls.sock.handle)
 	
 	conn_tls.close() or {}
 	
-	return rtt_tcp, rtt_tls, pmtu, mss, k_rtt, k_rcv_rtt, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, current_ip
+	return rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, current_ip
 }
 
 fn main() {
 	println(term.bold('= NetPrint ='))
 
-	target_host := 'google.com'
+	mut targets := []string{}
+	
+	if os.args.len > 1 {
+		targets = os.args[1..]
+	} else {
+		println('[*] No CLI targets provided.')
+		input := os.input('[?] Enter targets separated by spaces (e.g. google.com cloudflare.com):\n> ')
+		trimmed := input.trim_space()
+		if trimmed != '' {
+			raw_parts := trimmed.split(' ')
+			for part in raw_parts {
+				if part.trim_space() != '' {
+					targets << part.trim_space()
+				}
+			}
+		} else {
+			targets = ['google.com', 'cloudflare.com']
+		}
+	}
+
+	println('[*] Configured Monitoring Targets: ${targets}')
 	target_port := 443
 
-	println('[*] Performing pre-flight DNS validation...')
-	_ := net.resolve_addrs_fuzzy(target_host, .tcp) or {
-		eprintln(term.red('[FATAL] DNS resolution failed. Check your network adapter.'))
-		exit(1)
-	}
-
-	println('[*] Running 10-Cycle Calibration...')
-	mut rtts := []f64{}
-	mut ratios := []f64{}
-	mut pmtus := []u32{}
-	mut msses := []u32{}
-	mut k_rtts := []u32{}
-	mut k_rcv_rtts := []u32{}
-	mut k_rtos := []u32{}
-	mut k_cwnds := []u32{}
-	mut k_rttvars := []u32{}
-	mut k_tcp_opts := []u8{}
-	mut final_ja4s := ''
-	mut final_cert := ''
-
-	for i in 0 .. 10 {
-		rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, _ := probe_environment(target_host, target_port) or {
-			eprintln(term.yellow('[WARN] Cycle ${i+1} dropped. Retrying...'))
-			time.sleep(500 * time.millisecond)
+	mut baselines := map[string]EnvBaseline{}
+	
+	for target in targets {
+		println('\n' + term.bold('[*] Performing pre-flight DNS validation for ${target}...'))
+		_ := net.resolve_addrs_fuzzy(target, .tcp) or {
+			eprintln(term.red('[FATAL] DNS resolution failed for ${target}. Skipping this target.'))
 			continue
 		}
-		if err_code != 0 {
-			eprintln(term.red('[DEBUG] getsockopt failed with errno: ${err_code}'))
+
+		println('[*] Running 10-Cycle Calibration for ${target}...')
+		mut rtts := []f64{}
+		mut ratios := []f64{}
+		mut pmtus := []u32{}
+		mut msses := []u32{}
+		mut k_rtts := []u32{}
+		mut k_rcv_rtts := []u32{}
+		mut k_rtos := []u32{}
+		mut k_cwnds := []u32{}
+		mut k_rttvars := []u32{}
+		mut k_tcp_opts := []u8{}
+		mut final_ja4s := ''
+		mut final_cert := ''
+
+		for i in 0 .. 10 {
+			rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, k_rttvar, tcp_opts, err_code, ja4s, cert, _ := probe_environment(target, target_port) or {
+				eprintln(term.yellow('[WARN] Cycle ${i+1} dropped for ${target}. Retrying...'))
+				time.sleep(500 * time.millisecond)
+				continue
+			}
+			if err_code != 0 {
+				eprintln(term.red('[DEBUG] getsockopt failed with errno: ${err_code}'))
+			}
+			rtts << rtt_tcp
+			if rtt_tcp > 0 { ratios << (rtt_tls / rtt_tcp) }
+			if pmtu > 0 { pmtus << pmtu }
+			if mss > 0 { msses << mss }
+			if k_r > 0 { k_rtts << k_r }
+			if k_rcv > 0 { k_rcv_rtts << k_rcv }
+			if k_rto > 0 { k_rtos << k_rto }
+			if k_cwnd > 0 { k_cwnds << k_cwnd }
+			if k_rttvar > 0 { k_rttvars << k_rttvar }
+			if tcp_opts > 0 { k_tcp_opts << tcp_opts }
+			final_ja4s = ja4s
+			final_cert = cert
+			time.sleep(200 * time.millisecond)
 		}
-		rtts << rtt_tcp
-		if rtt_tcp > 0 { ratios << (rtt_tls / rtt_tcp) }
-		if pmtu > 0 { pmtus << pmtu }
-		if mss > 0 { msses << mss }
-		if k_r > 0 { k_rtts << k_r }
-		if k_rcv > 0 { k_rcv_rtts << k_rcv }
-		if k_rto > 0 { k_rtos << k_rto }
-		if k_cwnd > 0 { k_cwnds << k_cwnd }
-		if k_rttvar > 0 { k_rttvars << k_rttvar }
-		if tcp_opts > 0 { k_tcp_opts << tcp_opts }
-		final_ja4s = ja4s
-		final_cert = cert
-		time.sleep(200 * time.millisecond)
+
+		if rtts.len < 5 {
+			eprintln(term.red('[FATAL] Inadequate calibration samples collected for ${target}. Skipping.'))
+			continue
+		}
+
+		mut sum_rtt := 0.0
+		for r in rtts { sum_rtt += r }
+		mean_rtt := sum_rtt / f64(rtts.len)
+
+		mut sum_sq_diff := 0.0
+		for r in rtts { sum_sq_diff += math.pow(r - mean_rtt, 2) }
+		std_rtt := math.sqrt(sum_sq_diff / f64(rtts.len))
+
+		mut sum_ratio := 0.0
+		for rat in ratios { sum_ratio += rat }
+		mean_ratio := sum_ratio / f64(ratios.len)
+
+		base_pmtu := if pmtus.len > 0 { pmtus[pmtus.len - 1] } else { u32(1500) }
+		base_mss := if msses.len > 0 { msses[msses.len - 1] } else { u32(1460) }
+		base_k_rtt := if k_rtts.len > 0 { k_rtts[k_rtts.len - 1] } else { u32(0) }
+		base_k_rcv := if k_rcv_rtts.len > 0 { k_rcv_rtts[k_rcv_rtts.len - 1] } else { u32(0) }
+		base_k_rto := if k_rtos.len > 0 { k_rtos[k_rtos.len - 1] } else { u32(0) }
+		base_k_cwnd := if k_cwnds.len > 0 { k_cwnds[k_cwnds.len - 1] } else { u32(0) }
+		base_k_rttvar := if k_rttvars.len > 0 { k_rttvars[k_rttvars.len - 1] } else { u32(0) }
+		base_tcp_opts := if k_tcp_opts.len > 0 { k_tcp_opts[k_tcp_opts.len - 1] } else { u8(0) }
+
+		baselines[target] = EnvBaseline{
+			mean_rtt: mean_rtt
+			std_rtt: std_rtt
+			mean_ratio: mean_ratio
+			pmtu: base_pmtu
+			snd_mss: base_mss
+			kernel_rtt: base_k_rtt
+			kernel_rcv_rtt: base_k_rcv
+			kernel_rto: base_k_rto
+			kernel_cwnd: base_k_cwnd
+			kernel_rttvar: base_k_rttvar
+			tcp_opts: base_tcp_opts
+			tls_ja4s: final_ja4s
+			tls_cert: final_cert
+		}
+
+		println('\n' + term.bold(term.green('[+] Side-Channel Calibration Complete for ${target}:')))
+		println('    TCP Connect RTT:  ${term.cyan('${baselines[target].mean_rtt:.2f} ms')} (StdDev: ${term.gray('${baselines[target].std_rtt:.2f}')})')
+		println('    Handshake Ratio:  ${term.cyan('${baselines[target].mean_ratio:.3f}x')} (TLS/TCP delay ratio)')
+		println('    Kernel Peer RTT:  ${term.cyan('${(f64(baselines[target].kernel_rtt)/1000.0):.2f} ms')}')
+		println('    Receiver RTT:     ${term.cyan('${(f64(baselines[target].kernel_rcv_rtt)/1000.0):.2f} ms')}')
+		println('    Retransmit RTO:   ${term.cyan('${(f64(baselines[target].kernel_rto)/1000.0):.2f} ms')}')
+		println('    Kernel CWND Size: ${term.cyan('${baselines[target].kernel_cwnd}')}')
+		println('    Kernel RTT Var:   ${term.cyan('${(f64(baselines[target].kernel_rttvar)/1000.0):.2f} ms')}')
+		println('    Path MTU:         ${term.cyan('${baselines[target].pmtu} bytes')} | MSS: ${term.cyan('${baselines[target].snd_mss} bytes')}')
+		println('    TCP Options:      ${term.cyan(parse_tcp_options(baselines[target].tcp_opts))}')
+		println('    JA4S Fingerprint: ${term.yellow(baselines[target].tls_ja4s)}')
+		println('    Cert Signature:   ${term.yellow(baselines[target].tls_cert)}\n')
 	}
 
-	if rtts.len < 5 {
-		eprintln(term.red('[FATAL] Inadequate calibration samples collected. Aborting.'))
+	if baselines.len == 0 {
+		eprintln(term.red('[FATAL] No targets were successfully calibrated. Exiting.'))
 		exit(1)
 	}
 
-	mut sum_rtt := 0.0
-	for r in rtts { sum_rtt += r }
-	mean_rtt := sum_rtt / f64(rtts.len)
-
-	mut sum_sq_diff := 0.0
-	for r in rtts { sum_sq_diff += math.pow(r - mean_rtt, 2) }
-	std_rtt := math.sqrt(sum_sq_diff / f64(rtts.len))
-
-	mut sum_ratio := 0.0
-	for rat in ratios { sum_ratio += rat }
-	mean_ratio := sum_ratio / f64(ratios.len)
-
-	base_pmtu := if pmtus.len > 0 { pmtus[pmtus.len - 1] } else { u32(1500) }
-	base_mss := if msses.len > 0 { msses[msses.len - 1] } else { u32(1460) }
-	base_k_rtt := if k_rtts.len > 0 { k_rtts[k_rtts.len - 1] } else { u32(0) }
-	base_k_rcv := if k_rcv_rtts.len > 0 { k_rcv_rtts[k_rcv_rtts.len - 1] } else { u32(0) }
-	base_k_rto := if k_rtos.len > 0 { k_rtos[k_rtos.len - 1] } else { u32(0) }
-	base_k_cwnd := if k_cwnds.len > 0 { k_cwnds[k_cwnds.len - 1] } else { u32(0) }
-	base_k_rttvar := if k_rttvars.len > 0 { k_rttvars[k_rttvars.len - 1] } else { u32(0) }
-	base_tcp_opts := if k_tcp_opts.len > 0 { k_tcp_opts[k_tcp_opts.len - 1] } else { u8(0) }
-
-	baseline := EnvBaseline{
-		mean_rtt: mean_rtt
-		std_rtt: std_rtt
-		mean_ratio: mean_ratio
-		pmtu: base_pmtu
-		snd_mss: base_mss
-		kernel_rtt: base_k_rtt
-		kernel_rcv_rtt: base_k_rcv
-		kernel_rto: base_k_rto
-		kernel_cwnd: base_k_cwnd
-		kernel_rttvar: base_k_rttvar
-		tcp_opts: base_tcp_opts
-		tls_ja4s: final_ja4s
-		tls_cert: final_cert
-	}
-
-	println('\n' + term.bold(term.green('[+] Side-Channel Calibration Complete:')))
-	println('    TCP Connect RTT:  ${term.cyan('${baseline.mean_rtt:.2f} ms')} (StdDev: ${term.gray('${baseline.std_rtt:.2f}')})')
-	println('    Handshake Ratio:  ${term.cyan('${baseline.mean_ratio:.3f}x')} (TLS/TCP delay ratio)')
-	println('    Kernel Peer RTT:  ${term.cyan('${(f64(baseline.kernel_rtt)/1000.0):.2f} ms')}')
-	println('    Receiver RTT:     ${term.cyan('${(f64(baseline.kernel_rcv_rtt)/1000.0):.2f} ms')}')
-	println('    Retransmit RTO:   ${term.cyan('${(f64(baseline.kernel_rto)/1000.0):.2f} ms')}')
-	println('    Kernel CWND Size: ${term.cyan('${baseline.kernel_cwnd}')}')
-	println('    Kernel RTT Var:   ${term.cyan('${(f64(baseline.kernel_rttvar)/1000.0):.2f} ms')}')
-	println('    Path MTU:         ${term.cyan('${baseline.pmtu} bytes')} | MSS: ${term.cyan('${baseline.snd_mss} bytes')}')
-	println('    TCP Options:      ${term.cyan(parse_tcp_options(baseline.tcp_opts))}')
-	println('    JA4S Fingerprint: ${term.yellow(baseline.tls_ja4s)}')
-	println('    Cert Signature:   ${term.yellow(baseline.tls_cert)}\n')
 	println(term.gray('[*] Integrity lock engaged. Continuous passive scanning active...'))
 
 	for {
 		time.sleep(3 * time.second)
 		
-		rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, _, tcp_opts, err_code, ja4s, cert, current_ip := probe_environment(target_host, target_port) or {
-			println(term.yellow('[!] Socket session dropped (Transient network jitter or packet rejection)'))
-			continue
-		}
-		if err_code != 0 {
-			println(term.red('[DEBUG] runtime getsockopt failed with errno: ${err_code}'))
-		}
-
-		mut anomaly_score := 0
-		mut reasons := []string{}
-
-		current_ratio := if rtt_tcp > 0 { rtt_tls / rtt_tcp } else { 1.0 }
-		if rtt_tcp < 4.0 && current_ratio > (baseline.mean_ratio * 3.5) && rtt_tls > 30.0 {
-			anomaly_score += 45
-			reasons << 'Latency Asymmetry Detected: Ultra-low TCP connection RTT (${rtt_tcp:.1f}ms) with high TLS handshake RTT (${rtt_tls:.1f}ms). Handshake delay ratio: ${current_ratio:.1f}x (Expected: ${baseline.mean_ratio:.1f}x). Strong indicator of early TCP termination proxy.'
-		}
-
-		if pmtu != 0 && baseline.pmtu != 0 && pmtu != baseline.pmtu {
-			anomaly_score += 25
-			reasons << 'Path MTU Shift: PMTU migrated from ${baseline.pmtu} to ${pmtu}. Indicates active path re-routing or packet resizing by inline network hardware.'
-		}
-		if mss != 0 && baseline.snd_mss != 0 && mss != baseline.snd_mss {
-			anomaly_score += 20
-			reasons << 'Segment Size Shift: MSS mutated from ${baseline.snd_mss} to ${mss}. Probable TCP header rewriting or segment-level middlebox intervention.'
-		}
-
-		if k_rcv > 0 && baseline.kernel_rcv_rtt > 0 {
-			rcv_diff := math.abs(f64(k_rcv) - f64(baseline.kernel_rcv_rtt)) / 1000.0
-			if rcv_diff > 150.0 && rtt_tcp < 10.0 {
-				anomaly_score += 15
-				reasons << 'Receiver RTT Drift: Kernel tcpi_rcv_rtt deviated by ${rcv_diff:.1f}ms on local routing, indicating delayed ACK handling by the peer.'
+		for target, baseline in baselines {
+			rtt_tcp, rtt_tls, pmtu, mss, k_r, k_rcv, k_rto, k_cwnd, _, tcp_opts, err_code, ja4s, cert, current_ip := probe_environment(target, target_port) or {
+				println(term.yellow('[!] [${target}] Socket session dropped (Transient network jitter or packet rejection)'))
+				continue
 			}
-		}
-
-		if tcp_opts != 0 && baseline.tcp_opts != 0 && tcp_opts != baseline.tcp_opts {
-			anomaly_score += 30
-			reasons << 'TCP Options Mismatch: Negotiated options shifted from ${parse_tcp_options(baseline.tcp_opts)} to ${parse_tcp_options(tcp_opts)}. Indicates a transport-layer rewriting proxy.'
-		}
-
-		if ja4s != baseline.tls_ja4s {
-			anomaly_score += 35
-			reasons << 'TLS Fingerprint Mismatch: Cryptographic handshake signature altered. Expected: ${baseline.tls_ja4s}, Got: ${ja4s}. Indicates downstream TLS protocol renegotiation.'
-		}
-		if cert != baseline.tls_cert && cert != 'NO_CERT' && baseline.tls_cert != 'NO_CERT' {
-			anomaly_score += 50
-			reasons << 'TLS Certificate Mismatch: Handshake returned an altered certificate hash (Expected: ${baseline.tls_cert}, Got: ${cert}). Highly indicative of active SSL/TLS interception/decryption proxy.'
-		}
-
-		if is_private_ip(current_ip) {
-			anomaly_score += 50
-			reasons << 'DNS Resolution Divergence: Host resolved to a private/loopback RFC1918 address [${current_ip}]. Indicates local DNS spoofing or routing hijack.'
-		}
-
-		now_str := time.now().format_ss()
-		if anomaly_score == 0 {
-			println('[${now_str}] ${term.green('[SECURE]')} RTT-TCP:${rtt_tcp:.1f}ms | Ratio:${current_ratio:.2f}x | k_RTT:${(f64(k_r)/1000.0):.2f}ms | k_RTO:${(f64(k_rto)/1000.0):.1f}ms | CWND:${k_cwnd} | TCP-Opts:${parse_tcp_options(tcp_opts)}')
-		} else if anomaly_score >= 40 {
-			println('\n[${now_str}] ${term.bold(term.red('[!!! SYSTEM PATH ANOMALY DETECTED !!!]'))}')
-			println(' -> Cumulative Deviation Index: ${term.red('-${anomaly_score}')}')
-			for r in reasons {
-				println(' -> ${term.yellow(r)}')
+			if err_code != 0 {
+				println(term.red('[DEBUG] [${target}] runtime getsockopt failed with errno: ${err_code}'))
 			}
-			println('===========================================================\n')
-		} else {
-			println('[${now_str}] ${term.yellow('[WARN: CONTEXTUAL JITTER DETECTED]')} -> ${reasons[0]}')
+
+			mut anomaly_score := 0
+			mut reasons := []string{}
+
+			current_ratio := if rtt_tcp > 0 { rtt_tls / rtt_tcp } else { 1.0 }
+			if rtt_tcp < 4.0 && current_ratio > (baseline.mean_ratio * 3.5) && rtt_tls > 30.0 {
+				anomaly_score += 45
+				reasons << 'Latency Asymmetry Detected: Ultra-low TCP connection RTT (${rtt_tcp:.1f}ms) with high TLS handshake RTT (${rtt_tls:.1f}ms). Handshake delay ratio: ${current_ratio:.1f}x (Expected: ${baseline.mean_ratio:.1f}x). Strong indicator of early TCP termination proxy.'
+			}
+
+			if pmtu != 0 && baseline.pmtu != 0 && pmtu != baseline.pmtu {
+				anomaly_score += 25
+				reasons << 'Path MTU Shift: PMTU migrated from ${baseline.pmtu} to ${pmtu}. Indicates active path re-routing or packet resizing by inline network hardware.'
+			}
+			if mss != 0 && baseline.snd_mss != 0 && mss != baseline.snd_mss {
+				anomaly_score += 20
+				reasons << 'Segment Size Shift: MSS mutated from ${baseline.snd_mss} to ${mss}. Probable TCP header rewriting or segment-level middlebox intervention.'
+			}
+
+			if k_rcv > 0 && baseline.kernel_rcv_rtt > 0 {
+				rcv_diff := math.abs(f64(k_rcv) - f64(baseline.kernel_rcv_rtt)) / 1000.0
+				if rcv_diff > 150.0 && rtt_tcp < 10.0 {
+					anomaly_score += 15
+					reasons << 'Receiver RTT Drift: Kernel tcpi_rcv_rtt deviated by ${rcv_diff:.1f}ms on local routing, indicating delayed ACK handling by the peer.'
+				}
+			}
+
+			if tcp_opts != 0 && baseline.tcp_opts != 0 && tcp_opts != baseline.tcp_opts {
+				anomaly_score += 30
+				reasons << 'TCP Options Mismatch: Negotiated options shifted from ${parse_tcp_options(baseline.tcp_opts)} to ${parse_tcp_options(tcp_opts)}. Indicates a transport-layer rewriting proxy.'
+			}
+
+			if ja4s != baseline.tls_ja4s {
+				anomaly_score += 35
+				reasons << 'TLS Fingerprint Mismatch: Cryptographic handshake signature altered. Expected: ${baseline.tls_ja4s}, Got: ${ja4s}. Indicates downstream TLS protocol renegotiation.'
+			}
+			if cert != baseline.tls_cert && cert != 'NO_CERT' && baseline.tls_cert != 'NO_CERT' {
+				anomaly_score += 50
+				reasons << 'TLS Certificate Mismatch: Handshake returned an altered certificate hash (Expected: ${baseline.tls_cert}, Got: ${cert}). Highly indicative of active SSL/TLS interception/decryption proxy.'
+			}
+
+			if is_private_ip(current_ip) {
+				anomaly_score += 50
+				reasons << 'DNS Resolution Divergence: Host resolved to a private/loopback RFC1918 address [${current_ip}]. Indicates local DNS spoofing or routing hijack.'
+			}
+
+			now_str := time.now().format_ss()
+			if anomaly_score == 0 {
+				println('[${now_str}] [${target}] ${term.green('[SECURE]')} RTT-TCP:${rtt_tcp:.1f}ms | Ratio:${current_ratio:.2f}x | k_RTT:${(f64(k_r)/1000.0):.2f}ms | k_RTO:${(f64(k_rto)/1000.0):.1f}ms | CWND:${k_cwnd} | TCP-Opts:${parse_tcp_options(tcp_opts)}')
+			} else if anomaly_score >= 40 {
+				println('\n[${now_str}] [${target}] ${term.bold(term.red('[!!! SYSTEM PATH ANOMALY DETECTED !!!]'))}')
+				println(' -> Cumulative Deviation Index: ${term.red('-${anomaly_score}')}')
+				for r in reasons {
+					println(' -> ${term.yellow(r)}')
+				}
+				println('===========================================================\n')
+			} else {
+				println('[${now_str}] [${target}] ${term.yellow('[WARN: CONTEXTUAL JITTER DETECTED]')} -> ${reasons[0]}')
+			}
 		}
 	}
 }
