@@ -1,29 +1,33 @@
 # netprint
 
 ## Overview
-netprint is a low-level network telemetry and anomaly detection tool designed to identify environmental changes and traffic interception. It establishes a deterministic baseline of a network path and monitors for deviations in real-time.
+netprint is a low-level network telemetry and anomaly detection tool designed to identify environmental changes, transport-layer manipulation, and traffic interception. It establishes a deterministic, multi-dimensional baseline of a network path and monitors for deviations in real-time.
 
-The tool analyzes parameters across the OSI model, including Layer 3 (IP), Layer 4 (TCP), and Layer 7 (TLS), to detect routing shifts, middlebox interference, or cryptographic hijacking.
+By combining traditional rule-based heuristics with a lightweight **Neural Autoencoder** (powered by the VNM library), the tool analyzes features across the OSI model—spanning Layer 3 (IP), Layer 4 (TCP), and Layer 7 (TLS)—to identify active routing shifts, proxy-induced middlebox interference, or cryptographic hijacking.
 
 ---
 
 ## Technical Specifications
 
-### Fingerprinting Layers
-*   **Layer 3 (Network):** Monitors Path MTU (PMTU) shifts and performs real-time DNS resolution checks to identify redirection to private or loopback (RFC1918) networks.
-*   **Layer 4 (Transport):** Queries the Linux kernel's `tcp_info` structure via standard socket APIs. It analyzes TCP Maximum Segment Size (MSS), Kernel Peer RTT, Receiver RTT, Retransmit RTO, CWND Size, and RTT Variance. It also extracts a transport-layer options bitmask (negotiated flags such as TS, SACK, WSCALE, ECN, and TFO).
-*   **Layer 7 (Application):** Performs inline parsing of the TLS Server Hello records to extract the JA4S cryptographic fingerprint and calculates an FNV-1a hash of the server's primary SSL/TLS certificate.
+### Telemetry & Fingerprinting Layers
+*   **Layer 3 (Network):** Monitors Path MTU (PMTU) shifts and executes local DNS resolution checks to identify redirection to private or loopback (RFC1918) networks.
+*   **Layer 4 (Transport):** Queries the Linux kernel's `tcp_info` structure via standard socket APIs. It analyzes TCP Maximum Segment Size (MSS), Kernel Peer RTT, Receiver RTT, Retransmit RTO, CWND Size, and RTT Variance. It also extracts a transport-layer options bitmask (such as TS, SACK, WSCALE, ECN, and TFO flags).
+*   **Layer 7 (Application):** Performs inline parsing of the TLS Server Hello records to extract the JA4S cryptographic fingerprint and calculates a hash of the server's primary SSL/TLS certificate.
+*   **SOCKS5 Proxy Tunneling:** Supports native routing of all TCP probes and TLS handshakes through a SOCKS5 proxy while preserving auxiliary local DNS checks for side-channel validation.
 
-### Detection Logic
-1.  **Calibration Phase:** Executes 10 initial measurement cycles to map the path environment, learning baseline averages and standard deviations for connection latency, handshake ratios, and transport characteristics.
-2.  **Continuous Telemetry:** Periodically probes the target in real-time to monitor for live deviations.
-3.  **Cumulative Deviation Index:** Evaluates changes against baseline tolerances. If a combination of structural shifts (e.g., latency asymmetry, altered TLS signatures, modified TCP options) crosses safe thresholds, the tool generates a detailed system path anomaly report.
+### Detection & Machine Learning Logic
+1.  **Calibration Phase:** Executes 10 initial measurement cycles to map the path environment, dynamically discarding dropped handshakes or transient latency spikes to prevent baseline poisoning.
+2.  **Neural Autoencoder:** Learns normal path characteristics by training a neural network model to reconstruct the 13-dimensional scaled feature vector. 
+3.  **Online Self-Training:** Automatically adapts to slow, natural network drifts by executing tiny online optimization steps on states verified as highly secure (similarity >= 92%).
+4.  **Crypto-Anchored Latency Tolerance:** Minimizes false alarms under heavy congestion by scaling down latency-reconstruction penalties when cryptographic features (JA4S and Certificate Hash) match the baseline perfectly.
+5.  **Streak-Based Verification:** Suppresses transient network drops by requiring anomalies to persist for at least 3 consecutive cycles before confirming a critical path anomaly.
+6.  **User-Adjustable Confidence Threshold:** Allows operators to define custom similarity percentage thresholds (default: 70%) to adapt to varying network environments.
 
 ---
 
 ## Quick start (copy - paste - enter)
 ```bash
-pkg update -y && pkg install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/netprint && cd netprint && v -prod netprint.v -o netprint && ln -sf $(pwd)/netprint $PREFIX/bin/netprint
+pkg update -y && pkg install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && v install --git https://github.com/tailsmails/vnm && git clone --depth=1 https://github.com/tailsmails/netprint && cd netprint && v -prod netprint.v -o netprint && ln -sf $(pwd)/netprint $PREFIX/bin/netprint
 ```
 
 ---
@@ -32,12 +36,18 @@ pkg update -y && pkg install -y git clang make && if ! command -v v >/dev/null 2
 *   **Operating System:** Linux (required for native `tcp_info` kernel structure support).
 *   **Privileges:** Standard user privileges (root/sudo is **not** required, as it utilizes standard TCP sockets and the native `getsockopt` API instead of raw socket sniffing).
 *   **Compiler:** V programming language compiler.
+*   **Dependencies:** The `vnm` (V Neural Model) library.
 
 ---
 
 ## Installation
 
-Compile the source code using the V compiler:
+First, install the V Neural Model dependency:
+```bash
+v install --git https://github.com/tailsmails/vnm
+```
+
+Then, compile the source code using the V compiler:
 ```bash
 v -prod netprint.v -o netprint
 ```
@@ -51,14 +61,17 @@ Run the compiled executable directly:
 ./netprint
 ```
 
-*Note: The target host and port are configured within the source file (`google.com:443` by default).*
+Upon startup, the tool will prompt you for:
+1.  Optional target hosts.
+2.  Optional SOCKS5 proxy configurations.
+3.  A custom similarity percentage threshold (the confidence ceiling) to define the trigger level for anomaly detection.
 
 ---
 
 ## Log Interpretation
-*   **[SECURE]:** All parameters, signatures, and transport latencies align with the established baseline.
-*   **[WARN: CONTEXTUAL JITTER DETECTED]:** Minor network fluctuations (e.g., transient routing delays or minor transport-layer jitter).
-*   **[!!! SYSTEM PATH ANOMALY DETECTED !!!]:** Significant structural signature mismatch. Indicates a high probability of intermediate TCP termination, TLS interception/decryption, or active local DNS spoofing.
+*   **[SECURE]:** All parameters, signatures, and transport latencies align within expected bounds of the neural autoencoder (similarity meets or exceeds user threshold).
+*   **[WARN: CONTEXTUAL JITTER DETECTED]:** Transient network drops, momentary routing delays, or packet-level jitter that do not persist long enough to trigger an alarm.
+*   **[!!! SYSTEM PATH ANOMALY DETECTED !!!]:** Persistent structural signature mismatch over multiple cycles. Indicates a high probability of intermediate TCP termination, active TLS decryption/interception, or DNS spoofing.
 
 ---
 
