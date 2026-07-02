@@ -3,7 +3,7 @@
 ## Overview
 netprint is a low-level network telemetry and anomaly detection tool designed to identify environmental changes, transport-layer manipulation, and traffic interception. It establishes a deterministic, multi-dimensional baseline of a network path and monitors for deviations in real-time.
 
-By combining traditional rule-based heuristics with a lightweight **Neural Autoencoder** (powered by the VNM library), the tool analyzes features across the OSI model—spanning Layer 3 (IP), Layer 4 (TCP), and Layer 7 (TLS)—to identify active routing shifts, proxy-induced middlebox interference, or cryptographic hijacking.
+By combining traditional rule-based heuristics with a lightweight **Neural Autoencoder** (powered by the VNM library), the tool analyzes features across the OSI model-spanning Layer 3 (IP), Layer 4 (TCP), and Layer 7 (TLS) to identify active routing shifts, proxy-induced middlebox interference, or cryptographic hijacking.
 
 ---
 
