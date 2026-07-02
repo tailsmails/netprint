@@ -126,6 +126,12 @@ fn build_tls_client_hello(sni string) []u8 {
 	write_bytes(mut exts, 'h2'.bytes())
 	exts << u8(0x08)
 	write_bytes(mut exts, 'http/1.1'.bytes())
+
+	write_u16(mut exts, 0x0005)
+	write_u16(mut exts, 5)
+	exts << u8(1)
+	write_u16(mut exts, 0x0000)
+	write_u16(mut exts, 0x0000)
 	
 	mut hs := []u8{}
 	write_u16(mut hs, 0x0303)
@@ -141,7 +147,6 @@ fn build_tls_client_hello(sni string) []u8 {
 	
 	ciphers := [
 		u16(grease_cipher),
-		0x1301, 0x1302, 0x1303,
 		0xc02b, 0xc02f, 0xc02c, 0xc030,
 		0xcca9, 0xcca8,
 		0x009c, 0x009d
@@ -166,7 +171,8 @@ fn build_tls_client_hello(sni string) []u8 {
 	mut record := []u8{}
 	record << u8(0x16)
 	write_u16(mut record, 0x0301)
-	write_u16(mut record, hs_hdr.len)
+	record_len := hs_hdr.len
+	write_u16(mut record, record_len)
 	write_bytes(mut record, hs_hdr)
 	return record
 }
@@ -367,6 +373,36 @@ fn compute_scaled_mse(input vnm.Tensor, output vnm.Tensor) f64 {
 	return sum_err / f64(input.data.len)
 }
 
+struct DialResult {
+	conn &net.TcpConn
+	err  string
+}
+
+fn dial_worker(addr string, c chan DialResult) {
+	conn := net.dial_tcp(addr) or {
+		c <- DialResult{conn: unsafe { nil }, err: err.msg()}
+		return
+	}
+	c <- DialResult{conn: conn, err: ''}
+}
+
+fn dial_with_timeout(address string, timeout time.Duration) !&net.TcpConn {
+	ch := chan DialResult{}
+	spawn dial_worker(address, ch)
+	select {
+		res := <-ch {
+			if res.err != '' {
+				return error(res.err)
+			}
+			return res.conn
+		}
+		timeout {
+			return error('Connection timed out')
+		}
+	}
+	return error('unreachable')
+}
+
 fn probe_environment(host string, port int, proxy string) !(f64, f64, u32, u32, u32, u32, u32, u32, u32, u8, int, string, string, string) {
 	addrs := net.resolve_addrs_fuzzy(host, .tcp) or { []net.Addr{} }
 	mut current_ip := '0.0.0.0'
@@ -391,7 +427,7 @@ fn probe_environment(host string, port int, proxy string) !(f64, f64, u32, u32, 
 		p_port := if parts.len > 1 { parts[1].int() } else { 1080 }
 		connect_via_socks5(p_host, p_port, host, port)!
 	} else {
-		net.dial_tcp('${host}:${port}')!
+		dial_with_timeout('${host}:${port}', 5 * time.second)!
 	}
 	rtt_tcp := f64(sw.elapsed().microseconds()) / 1000.0 
 	conn.close() or {}
@@ -402,7 +438,7 @@ fn probe_environment(host string, port int, proxy string) !(f64, f64, u32, u32, 
 		p_port := if parts.len > 1 { parts[1].int() } else { 1080 }
 		connect_via_socks5(p_host, p_port, host, port)!
 	} else {
-		net.dial_tcp('${host}:${port}')!
+		dial_with_timeout('${host}:${port}', 5 * time.second)!
 	}
 	conn_tls.set_read_timeout(5 * time.second)
 	
@@ -500,8 +536,16 @@ fn main() {
 
 	for target in targets {
 		if proxy == '' {
-			println('\n' + term.bold('[*] Performing pre-flight DNS validation for ${target}...'))
-			_ := net.resolve_addrs_fuzzy(target, .tcp) or {
+			println('\n' + term.bold('[*] Performing pre-flight connectivity check for ${target}...'))
+			println(term.gray('[!] Checking connection on port 443 with a 4-second timeout...'))
+			mut test_conn := dial_with_timeout('${target}:443', 4 * time.second) or {
+				eprintln(term.red('[FATAL] Connection to ${target}:443 failed or timed out. Please configure a SOCKS5 proxy!'))
+				continue
+			}
+			test_conn.close() or {}
+			println(term.green('[+] Connection verified!'))
+			
+			_ = net.resolve_addrs_fuzzy(target, .tcp) or {
 				eprintln(term.red('[FATAL] DNS resolution failed for ${target}. Skipping this target.'))
 				continue
 			}
