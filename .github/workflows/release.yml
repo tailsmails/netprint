@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+env:
+  APP_NAME: netprint
+  EXTRA_FLAGS: "-d vnm_f64"
+
 jobs:
   release:
     runs-on: ${{ matrix.runner }}
@@ -16,10 +20,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - target: linux-amd64
             runner: ubuntu-latest
-            build_cmd: v -d vnm_f64 -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o netprint-linux-amd64 .
-            
+            setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
+            build_cmd: v $EXTRA_FLAGS -enable-globals -prod -autofree -cc musl-gcc -cflags "-static" -os linux -arch amd64 -o $APP_NAME-linux-amd64 .
+            artifact_suffix: -linux-amd64
+
+          - target: linux-arm64
+            runner: ubuntu-latest
+            setup_cmd: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            build_cmd: v $EXTRA_FLAGS -enable-globals -prod -autofree -cc aarch64-linux-gnu-gcc -cflags "-static" -os linux -arch arm64 -o $APP_NAME-linux-arm64 .
+            artifact_suffix: -linux-arm64
+
+          - target: android-arm64
+            runner: ubuntu-latest
+            setup_cmd: ""
+            build_cmd: |
+              v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64 -llog
+            artifact_suffix: -android-arm64
+
+          - target: android-arm
+            runner: ubuntu-latest
+            setup_cmd: ""
+            build_cmd: |
+              v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm -llog
+            artifact_suffix: -android-arm
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,7 +57,11 @@ jobs:
         with:
           check-latest: true
 
-      - name: Install dependencies
+      - name: Setup Compiler Dependencies
+        if: matrix.setup_cmd != ''
+        run: ${{ matrix.setup_cmd }}
+
+      - name: Setup Dependencies
         run: v install --git https://github.com/tailsmails/vnm
 
       - name: Build binary
@@ -40,7 +72,7 @@ jobs:
         with:
           tag: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          artifacts: netprint-linux-${{ matrix.arch }}
+          artifacts: ${{ env.APP_NAME }}${{ matrix.artifact_suffix }}
           generateReleaseNotes: true
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
