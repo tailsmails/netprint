@@ -25,13 +25,6 @@ By combining traditional rule-based heuristics with a lightweight **Neural Autoe
 
 ---
 
-## Quick start (copy - paste - enter)
-```bash
-apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && v install --git https://github.com/tailsmails/vnm && git clone --depth=1 https://github.com/tailsmails/netprint && cd netprint && v -prod netprint.v -o netprint && ln -sf $(pwd)/netprint $PREFIX/bin/netprint
-```
-
----
-
 ## Requirements
 *   **Operating System:** Linux (required for native `tcp_info` kernel structure support).
 *   **Privileges:** Standard user privileges (root/sudo is **not** required, as it utilizes standard TCP sockets and the native `getsockopt` API instead of raw socket sniffing).
