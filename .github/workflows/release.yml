@@ -13,7 +13,7 @@ env:
   EXTRA_FLAGS: "-d vnm_f64"
 
 jobs:
-  release:
+  build:
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -24,9 +24,9 @@ jobs:
             runner: ubuntu-latest
             setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
             build_cmd: |
-              v $EXTRA_FLAGS -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
+              v $EXTRA_FLAGS -d no_backtrace -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
               musl-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-amd64 -lm
-            artifact_suffix: -linux-amd64
+            artifact_name: dnshammer-linux-amd64
 
           - target: linux-arm64
             runner: ubuntu-latest
@@ -34,7 +34,7 @@ jobs:
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
               aarch64-linux-gnu-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-arm64 -lm
-            artifact_suffix: -linux-arm64
+            artifact_name: dnshammer-linux-arm64
 
           - target: android-arm64
             runner: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
               $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64 -llog -lm
-            artifact_suffix: -android-arm64
+            artifact_name: dnshammer-android-arm64
 
           - target: android-arm
             runner: ubuntu-latest
@@ -50,7 +50,7 @@ jobs:
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
               $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm -llog -lm
-            artifact_suffix: -android-arm
+            artifact_name: dnshammer-android-arm
 
     steps:
       - name: Checkout
@@ -71,12 +71,28 @@ jobs:
       - name: Build binary
         run: ${{ matrix.build_cmd }}
 
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
       - name: Upload to Release
         uses: ncipollo/release-action@v1
         with:
           tag: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          artifacts: ${{ env.APP_NAME }}${{ matrix.artifact_suffix }}
+          artifacts: ./artifacts/*
           generateReleaseNotes: true
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
