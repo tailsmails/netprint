@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_NAME: dnshammer
+  APP_NAME: netprint
   EXTRA_FLAGS: "-d vnm_f64"
 
 jobs:
