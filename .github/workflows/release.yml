@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_NAME: netprint
+  APP_NAME: dnshammer
   EXTRA_FLAGS: "-d vnm_f64"
 
 jobs:
@@ -23,13 +23,17 @@ jobs:
           - target: linux-amd64
             runner: ubuntu-latest
             setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
-            build_cmd: v $EXTRA_FLAGS -enable-globals -prod -autofree -cc musl-gcc -cflags "-static" -os linux -arch amd64 -o $APP_NAME-linux-amd64 .
+            build_cmd: |
+              v $EXTRA_FLAGS -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
+              musl-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-amd64 -lm
             artifact_suffix: -linux-amd64
 
           - target: linux-arm64
             runner: ubuntu-latest
             setup_cmd: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-            build_cmd: v $EXTRA_FLAGS -enable-globals -prod -autofree -cc aarch64-linux-gnu-gcc -cflags "-static" -os linux -arch arm64 -o $APP_NAME-linux-arm64 .
+            build_cmd: |
+              v $EXTRA_FLAGS -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
+              aarch64-linux-gnu-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-arm64 -lm
             artifact_suffix: -linux-arm64
 
           - target: android-arm64
@@ -37,7 +41,7 @@ jobs:
             setup_cmd: ""
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
-              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64 -llog
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64 -llog -lm
             artifact_suffix: -android-arm64
 
           - target: android-arm
@@ -45,7 +49,7 @@ jobs:
             setup_cmd: ""
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
-              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm -llog
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm -llog -lm
             artifact_suffix: -android-arm
 
     steps:
