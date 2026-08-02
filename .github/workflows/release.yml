@@ -25,32 +25,32 @@ jobs:
             setup_cmd: sudo apt-get update && sudo apt-get install -y musl-tools
             build_cmd: |
               v $EXTRA_FLAGS -d no_backtrace -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
-              musl-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-amd64 -lm
-            artifact_name: dnshammer-linux-amd64
+              musl-gcc -O3 -static $APP_NAME.c -o $APP_NAME$SUFFIX -lm
+            artifact_suffix: -linux-amd64
 
           - target: linux-arm64
             runner: ubuntu-latest
             setup_cmd: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os linux -o $APP_NAME.c .
-              aarch64-linux-gnu-gcc -O3 -static $APP_NAME.c -o $APP_NAME-linux-arm64 -lm
-            artifact_name: dnshammer-linux-arm64
+              aarch64-linux-gnu-gcc -O3 -static $APP_NAME.c -o $APP_NAME$SUFFIX -lm
+            artifact_suffix: -linux-arm64
 
           - target: android-arm64
             runner: ubuntu-latest
             setup_cmd: ""
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
-              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm64 -llog -lm
-            artifact_name: dnshammer-android-arm64
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME$SUFFIX -llog -lm
+            artifact_suffix: -android-arm64
 
           - target: android-arm
             runner: ubuntu-latest
             setup_cmd: ""
             build_cmd: |
               v $EXTRA_FLAGS -enable-globals -prod -autofree -os android -o $APP_NAME.c .
-              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME-android-arm -llog -lm
-            artifact_name: dnshammer-android-arm
+              $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang -O3 -fPIE -pie $APP_NAME.c -o $APP_NAME$SUFFIX -llog -lm
+            artifact_suffix: -android-arm
 
     steps:
       - name: Checkout
@@ -70,12 +70,14 @@ jobs:
 
       - name: Build binary
         run: ${{ matrix.build_cmd }}
+        env:
+          SUFFIX: ${{ matrix.artifact_suffix }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: ${{ env.APP_NAME }}${{ matrix.artifact_suffix }}
+          path: ${{ env.APP_NAME }}${{ matrix.artifact_suffix }}
 
   publish:
     needs: build
