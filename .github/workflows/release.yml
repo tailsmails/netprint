@@ -43,4 +43,4 @@ jobs:
           artifacts: netprint-linux-${{ matrix.arch }}
           generateReleaseNotes: true
           allowUpdates: true
-          token: ${{ secrets.GITHUB_TOKEN }}-enable-globals
+          token: ${{ secrets.GITHUB_TOKEN }}
