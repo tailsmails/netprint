@@ -18,7 +18,7 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-latest
-            build_cmd: v -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o netprint-linux-amd64 .
+            build_cmd: v -d vnm_f64 -enable-globals -prod -cflags "-static" -os linux -arch amd64 -o netprint-linux-amd64 .
             
     steps:
       - name: Checkout
@@ -29,11 +29,11 @@ jobs:
         with:
           check-latest: true
 
-      - name: Build binary
-        run: ${{ matrix.build_cmd }}
-
       - name: Install dependencies
         run: v install --git https://github.com/tailsmails/vnm
+
+      - name: Build binary
+        run: ${{ matrix.build_cmd }}
 
       - name: Upload to Release
         uses: ncipollo/release-action@v1
@@ -43,4 +43,4 @@ jobs:
           artifacts: netprint-linux-${{ matrix.arch }}
           generateReleaseNotes: true
           allowUpdates: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}-enable-globals
